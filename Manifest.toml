@@ -2,7 +2,7 @@
 
 julia_version = "1.10.5"
 manifest_format = "2.0"
-project_hash = "5b1d99ff643c93767f46e8e3a25655731525e38e"
+project_hash = "3c51071ebd4ec53deb6b3961516060497a0f2df5"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "99a6f5d0ce1c7c6afdb759daa30226f71c54f6b0"
@@ -417,7 +417,7 @@ version = "1.15.1"
 
 [[deps.DilPredict]]
 deps = ["AbstractGPs", "CairoMakie", "DSP", "DelimitedFiles", "Dierckx", "Enzyme", "ForwardDiff", "GLMakie", "Interpolations", "JLD2", "KernelFunctions", "LinearAlgebra", "NLopt", "Optim", "Optimization", "OptimizationOptimJL", "ParameterHandling", "Printf", "Random", "SavitzkyGolay", "Statistics", "Stheno", "TOML", "Zygote"]
-git-tree-sha1 = "4adff6d9adfe15b856c0b12214947c133fb52360"
+git-tree-sha1 = "9913a0a081895073bd6f6657451fee54df017f70"
 repo-rev = "master"
 repo-url = "../DilPredict"
 uuid = "a103a12c-0188-489c-a78d-3708ca4db92e"
