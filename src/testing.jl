@@ -2,13 +2,13 @@ using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationO
 using Enzyme, GLMakie
 
 function pull_test_data()
-    trial_path = "../dil_data/dil_V3016_2014-02-17_canmet/"
+    trial_path = "../dil_data/dil_V3010A_2014-02-17_canmet/"
     trial = DilPredict.get_trial(trial_path)
     # using 0.07 because it is slightly larger
     # than the average dt in the original data
-    T, dL, t, _, dTdt = DilPredict.regularize(trial, 0.07)
+    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, 0.05)
     X = hcat(T...)
-    Y = hcat(dL...)
+    Y = hcat(dLdT...)
     dTdt = hcat(dTdt...)
     return (X, Y, t, dTdt)
 end
@@ -176,8 +176,8 @@ function opt_kernel(θi, D, Y)
     #    storage .= grad_nlogp(θ, D, Y)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
-    of = OptimizationFunction(loss)#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[0.01, 0.1, 0.00001], ub=[200.0, 200.0, 0.05])
+    of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
+    prob = OptimizationProblem(of, θi, [], lb=[0.0001, 0.001, 0.00001], ub=[200.0, 100.0, 0.5])
     sol = solve(prob, Optim.LBFGS(); show_trace=true)
     return sol
 end 
@@ -186,8 +186,8 @@ export opt_kernel
 function opt_kernel_dual(θi, D_T, D_CR, Y)
     loss(θ, p) = nlogp_dual(θ, D_T, D_CR, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[0.001, 0.001, 0.0001],
-                               ub=[200.0, Inf, 5.0])
+    prob = OptimizationProblem(of, θi, [], lb=[0.0001, 0.00001, 0.0000001],
+                               ub=[Inf, Inf, 5.0])
     sol = solve(prob, Optim.LBFGS(); show_trace=true, maxiters=30000)
     return sol
 end 
@@ -250,7 +250,7 @@ function inference_surface(crate_max, crate_min, m, X, Y, dTdt, θ)
     end
     f = Figure()
     ax = Axis3(f[1,1];
-               xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="ΔL (μm)")
+               xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="dL/dT (μm/°C)")
 
     for i in 1:m
         y = xstars_CR[:, i]
@@ -276,12 +276,12 @@ export inference_surface
 
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
-function single_cr_plot(cr, X, Y, θ, t)
+function single_cr_plot(cr, X, Y, θ)
     n = size(X, 1)
     xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
-    means, vars = predict_y(X, xstars, Y, θ, t)
+    means, vars = predict_y(X, xstars, Y, θ)
     f = Figure()
-    ax = Axis(f[1,1], xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true)
+    ax = Axis(f[1,1], xlabel="Temp. (°C)", ylabel="dL/dT (μm/°C)", xreversed=true)
     lower = means .- sqrt.(vars)
     upper = means .+ sqrt.(vars)
     band!(ax, xstars, lower, upper; alpha=0.4)
@@ -290,13 +290,15 @@ function single_cr_plot(cr, X, Y, θ, t)
 end
 export single_cr_plot
 
-function single_cr_plot!(cr, X, Y, θ, t)
+function single_cr_plot!(cr, X, Y, θ)
     n = size(X, 1)
     xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
-    means, vars = predict_y(X, xstars, Y, θ, t)
+    means, vars = predict_y(X, xstars, Y, θ)
     lower = means .- sqrt.(vars)
     upper = means .+ sqrt.(vars)
     band!(xstars, lower, upper; alpha=0.4)
     lines!(xstars, means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!
+
+#TODO: Implement Matern Kernel
