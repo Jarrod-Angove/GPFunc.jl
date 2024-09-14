@@ -1,14 +1,15 @@
 using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationOptimJL
-using Enzyme, GLMakie
+using Enzyme, GLMakie, Statistics
 
 function pull_test_data()
-    trial_path = "../dil_data/dil_V3010A_2014-02-17_canmet/"
+    trial_path = "../dil_data/dil_V3016_2014-02-17_canmet/"
     trial = DilPredict.get_trial(trial_path)
     # using 0.07 because it is slightly larger
-    # than the average dt in the original data
-    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, 0.05)
+    # than the average dt in the original data for 3016
+    # TODO: Find some way to automate this
+    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, 0.07)
     X = hcat(T...)
-    Y = hcat(dLdT...)
+    Y = hcat(dL...)
     dTdt = hcat(dTdt...)
     return (X, Y, t, dTdt)
 end
@@ -77,6 +78,36 @@ function cos_dis(X1, X2)
 end
 export cos_dis
 
+function T_dist_i(X_i::Vector{Float64})::Matrix{Float64}
+    return [-(i - j)^2 for i in X_i, j in X_i]
+end
+export T_dist_i
+
+function T_dist_i(X1::Vector{Float64}, X2::Vector{Float64})::Matrix{Float64}
+    return [-(i - j)^2 for i in X1, j in X2]
+end
+export T_dist_i
+
+function T_dist(X::Matrix{Float64})::Array{Float64, 3}
+    n, N = size(X)
+    D = zeros(N, N, n)
+    for i in 1:n
+        D[:,:, i] .= T_dist_i(X[i, :])
+    end
+    return D
+end
+export T_dist
+
+#TODO: Finish writing this to take two inputs
+function T_dist(X1, X2)
+    n, N = size(X1)
+    N2 = minimum(size(Matrix(X2')))
+    D = zeros(N, N2, n)
+    D .= [-(X1[k, i] - X2[k, j])^2 for i in 1:N, j in 1:N2, k in 1:n]
+    return D
+end
+return T_dist
+
 function exponentiated_kernel(D, σ, l)
     K = σ^2 .* exp.(D ./ l^2)
     return K
@@ -135,85 +166,73 @@ function grad_nlogp(θ, D, Y)
 end
 export grad_nlogp
 
-function nlogp(θ, D, Y)
-    N, _, n = size(D)
-    σ = θ[1]; l = θ[2]; σ_n = θ[3]
-    K = exponentiated_kernel(D, σ, l) .+ signal_noise(D, σ_n)
+function nlogp(θ, D_hist, D_instant, Y)
+    N, _, n = size(D_hist)
+    σ_hist = θ[1]; l_hist = θ[2];
+    σ_inst = 1.0; l_inst = θ[3]; σ_n = 0.03
+    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
+        exponentiated_kernel(D_instant, σ_inst, l_inst)
+        .+ signal_noise(D_hist, σ_n))
     #nlogp_all = Vector{Float64}(undef,n)
     nlogp_all = 0.0
     for k in 1:n
         y = @view Y[k, :]
+        μ_X = mean(y)
         K_t = @view K[:,:,k]
         L = cholesky(K_t) 
-        α = L.U \ (L.L \ y)
-        nlogp_all += 0.5 * (y'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
+        α = L.U \ (L.L \ (y .- μ_X))
+        nlogp_all += 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
     end
     return nlogp_all
 end
 export nlogp
 
-function nlogp_dual(θ, D_T, D_CR, Y)
-    N, _, n = size(D_T)
-    l_T = θ[1]; l_CR = θ[2]; σ_n = θ[3]
-
-    K = exponentiated_kernel_dual(D_T, D_CR, l_T, l_CR) .+ signal_noise(D_T, σ_n)
-    #nlogp_all = Vector{Float64}(undef,n)
-    nlogp_all = 0.0
-    for k in 1:n
-        y = @view Y[k, :]
-        K_t = @view K[:,:,k]
-        L = cholesky(K_t) 
-        α = L.U \ (L.L \ y)
-        nlogp_all += 0.5 * (y'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
-    end
-    return nlogp_all
-end
-export nlogp_dual
-
-function opt_kernel(θi, D, Y)
-    loss(θ, p) = nlogp(θ, D, Y)
+function opt_kernel(θi, D_hist, D_instant, Y)
+    loss(θ, p) = nlogp(θ, D_hist, D_instant, Y)
     #function loss_grad!(storage::Array{Float64}, θ::Vector{Float64}, p)::Array{Float64}
     #    storage .= grad_nlogp(θ, D, Y)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[0.0001, 0.001, 0.00001], ub=[200.0, 100.0, 0.5])
-    sol = solve(prob, Optim.LBFGS(); show_trace=true)
+    prob = OptimizationProblem(of, θi, [], lb=[0.0003, 0.001, 0.000001],
+                               ub=[1e6, 1e6, 1e6])
+    sol = solve(prob, Optim.BFGS(); show_trace=true)
     return sol
 end 
 export opt_kernel
-
-function opt_kernel_dual(θi, D_T, D_CR, Y)
-    loss(θ, p) = nlogp_dual(θ, D_T, D_CR, Y)
-    of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[0.0001, 0.00001, 0.0000001],
-                               ub=[Inf, Inf, 5.0])
-    sol = solve(prob, Optim.LBFGS(); show_trace=true, maxiters=30000)
-    return sol
-end 
-export opt_kernel_dual
 # θi = [11.5, 0.7, 0.14]
 
+# TODO: Finish adding the inst kernel
 function predict_y(X, X_star, Y, θ)
     if size(X_star, 1) != size(X, 1) 
             throw("Dim of X_star dne dim of X")
     end
     n, N = size(X)
-    D = cos_dis(X)
-    D_star = cos_dis(X, X_star)
-    σ = θ[1]; l = θ[2]; σ_n = θ[3];
-    K = exponentiated_kernel(D, σ, l) + signal_noise(D, σ_n)
-    K_star = exponentiated_kernel(D_star, σ, l)
-    k_ss = exponentiated_kernel(1.0, σ, l)
+    D_instant = T_dist(X)
+    D_hist = cos_dis(X)
+    D_star_hist = cos_dis(X, X_star)
+    D_star_inst = T_dist(X, X_star)
+    σ_hist = θ[1]; l_hist = θ[2];
+    σ_inst = 1.0; l_inst = θ[3]; σ_n = 0.03
+   K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
+        exponentiated_kernel(D_instant, σ_inst, l_inst)
+        .+ signal_noise(D_hist, σ_n))
+    K_star = (exponentiated_kernel(D_star_hist, σ_hist, l_hist) .*
+        exponentiated_kernel(D_star_inst, σ_inst, l_inst)
+        .+ signal_noise(D_star_hist, σ_n))
+    k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist) .*
+        exponentiated_kernel(1.0, σ_inst, l_inst))
 
     μ = Vector{Float64}(undef, n)
     s = Vector{Float64}(undef, n)
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
+        μ_X = mean(y)
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
-        μ[k] = (K_star_t' * (L.U\(L.L\y)))[1]
+        # Assume that μ_* = μ_X:
+        μ[k] = μ_X .+ (K_star_t' * (L.U\(L.L\(y .- μ_X))))[1]
         ν = (L.L \ K_star_t)
         s[k] = k_ss - (ν' * ν)[1]
     end
@@ -279,25 +298,25 @@ export inference_surface
 function single_cr_plot(cr, X, Y, θ)
     n = size(X, 1)
     xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
-    means, vars = predict_y(X, xstars, Y, θ)
+    means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ)
     f = Figure()
     ax = Axis(f[1,1], xlabel="Temp. (°C)", ylabel="dL/dT (μm/°C)", xreversed=true)
-    lower = means .- sqrt.(vars)
-    upper = means .+ sqrt.(vars)
-    band!(ax, xstars, lower, upper; alpha=0.4)
-    lines!(ax, xstars, means, label="CR = $cr (°C/s)")
-    return f, ax
+    lower = means .- sqrt.(abs.(vars))
+    upper = means .+ sqrt.(abs.(vars))
+    band!(ax, xstars[5:end], lower, upper; alpha=0.4)
+    lines!(ax, xstars[5:end], means, label="CR = $cr (°C/s)")
+    return f
 end
 export single_cr_plot
 
 function single_cr_plot!(cr, X, Y, θ)
     n = size(X, 1)
     xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
-    means, vars = predict_y(X, xstars, Y, θ)
-    lower = means .- sqrt.(vars)
-    upper = means .+ sqrt.(vars)
-    band!(xstars, lower, upper; alpha=0.4)
-    lines!(xstars, means, label="CR = $cr (°C/s)")
+    means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ)
+    lower = means .- sqrt.(abs.(vars))
+    upper = means .+ sqrt.(abs.(vars))
+    band!(xstars[5:end], lower, upper; alpha=0.4)
+    lines!(xstars[5:end], means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!
 
