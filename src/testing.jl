@@ -9,7 +9,7 @@ function pull_test_data()
     # TODO: Find some way to automate this
     T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, 0.07)
     X = hcat(T...)
-    Y = hcat(dLdT...)
+    Y = hcat(dL...)
     dTdt = hcat(dTdt...)
     return (X, Y, t, dTdt)
 end
@@ -114,6 +114,14 @@ function exponentiated_kernel(D, σ, l)
 end
 export exponentiated_kernel
 
+# What's the difference between besselj and bessely?
+function matern_kernel(d, σ, l, ν)
+    d = 2 - 2 * (d - 1e-8)
+    y = sqrt(2*ν) * d
+    σ^2 * (2^(1-ν))/(gamma(1.5)) * (y/l)^ν * besselk(ν, y/l)
+end
+export matern_kernel
+
 function exponentiated_kernel_dual(D_T, D_CR, l_T, l_CR)
     K_T = exp.(D_T ./ l_T^2)
     K_CR = exp.(D_CR ./ l_CR^2)
@@ -166,7 +174,7 @@ function grad_nlogp(θ, D, Y)
 end
 export grad_nlogp
 
-function nlogp(θ, D_hist, D_instant, Y; σ_n = 0.02)
+function nlogp(θ, D_hist, D_instant, Y; σ_n = 5.0)
     N, _, n = size(D_hist)
     σ_hist = θ[1]; l_hist = θ[2];
     σ_inst = 1.0; l_inst = θ[3];
@@ -187,7 +195,28 @@ function nlogp(θ, D_hist, D_instant, Y; σ_n = 0.02)
 end
 export nlogp
 
-function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 0.02)
+function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
+    N, _, n = size(D_hist)
+    σ_hist = θ[1]; l_hist = θ[2];
+    σ_inst = 1.0; l_inst = θ[3];
+    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
+        exponentiated_kernel(D_instant, σ_inst, l_inst)
+        .+ signal_noise(D_hist, σ_n))
+    #nlogp_all = Vector{Float64}(undef,n)
+    nlogp_all = Vector{Float64}(undef, n)
+    for k in 1:n
+        y = @view Y[k, :]
+        μ_X = mean(y)
+        K_t = @view K[:,:,k]
+        L = cholesky(K_t) 
+        α = L.U \ (L.L \ (y .- μ_X))
+        nlogp_all[k] = 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
+    end
+    return nlogp_all
+end
+export nlogp_slices
+
+function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 0.00011)
     loss(θ, p) = nlogp(θ, D_hist, D_instant, Y; σ_n = σ_n)
     #function loss_grad!(storage::Array{Float64}, θ::Vector{Float64}, p)::Array{Float64}
     #    storage .= grad_nlogp(θ, D, Y)
@@ -217,7 +246,7 @@ function predict_y(X, X_star, Y, θ; σ_n = 5.0)
    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_instant, σ_inst, l_inst)
         .+ signal_noise(D_hist, σ_n))
-    K_star = (exponentiated_kernel(D_star_hist, σ_hist, l_hist) .*
+    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_star_inst, σ_inst, l_inst)
         .+ signal_noise(D_star_hist, σ_n))
     k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist) .*
@@ -256,7 +285,7 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
-function inference_surface(crate_max, crate_min, m, X, Y, dTdt, θ)
+function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.00011)
     n, N = size(X)
     rates = range(crate_min, crate_max; length=m)
     means = Matrix{Float64}(undef, n, m)
@@ -265,34 +294,67 @@ function inference_surface(crate_max, crate_min, m, X, Y, dTdt, θ)
     xstars_CR = Matrix{Float64}(undef, n, m)
     Threads.@threads for i in eachindex(rates)
         xstars_T[:, i], xstars_CR[:,i] = build_x_star(900.0, 30.0, rates[i], 0.07, n) 
-        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ)
+        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=0.00011)
     end
     f = Figure()
     ax = Axis3(f[1,1];
-               xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="dL/dT (μm/°C)")
+               xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="ΔL (μm)")
 
+    σ_high = maximum(sqrt.(abs.(vars)))
+    σ_low = minimum(sqrt.(abs.(vars)))
     for i in 1:m
         y = xstars_CR[:, i]
         x = xstars_T[:, i]
         z = means[:,i]
-        σ = sqrt.(vars[:,i])
+        σ = sqrt.(abs.(vars[:,i]))
         dmat = hcat(x,y,z, σ)
         dmat = hcat([dmat[i, :] for i in 1:size(dmat,1) if dmat[i,1] > 40.0]...)'
         x = dmat[:, 1]; y = dmat[:, 2]; z = dmat[:,3]; σ = dmat[:,4]
-        lines!(ax,x,y,z, color=z, linewidth=3)
+        lines!(ax,x,y,z, color=σ, linewidth=3, colorrange=(σ_low, σ_high))
     end
-
-    #for i in 1:Na
-    #    y =  (-1) .* dTdt[:,i]
-    #    x = X[:, i]
-    #    z = Y[:, i]
-    #    lines!(ax, x, y, z; color=:black, linewidth=3.0)
-    #end
-    #ylims!(ax, 0.0, 21.0)
+    Colorbar(f[1,2], limits = (σ_low, σ_high))
     return f
 end
 export inference_surface
 
+function inference_surface_t(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.00011)
+    n, N = size(X)
+    rates = 10 .^ range(log10(crate_min), log10(crate_max); length=m)
+    means = Matrix{Float64}(undef, n, m)
+    vars = Matrix{Float64}(undef, n, m)
+    xstars_T = Matrix{Float64}(undef, n, m)
+    xstars_CR = Matrix{Float64}(undef, n, m)
+
+    Threads.@threads for i in eachindex(rates)
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(900.0, 30.0, rates[i], 0.07, n) 
+        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=0.00011)
+    end
+    f = Figure()
+    ax = Axis3(f[1,1];
+               ylabel="Temp. (°C)", xlabel="log(t) (s)", zlabel="ΔL (μm)", xreversed=false)
+
+    σ_maxs = []
+    σ_mins = []
+    cte_low = minimum(means)
+    cte_high = maximum(means)
+    for i in 1:m
+        y = xstars_CR[:, i]
+        x = xstars_T[:, i]
+        z = means[:,i]
+        σ = sqrt.(abs.(vars[:,i]))
+        push!(σ_maxs, maximum(σ))
+        push!(σ_mins, minimum(σ))
+        dmat = hcat(x,log10.(t),z, σ)
+        dmat = hcat([dmat[i, :] for i in 1:size(dmat,1)]...)'
+        x = dmat[:, 1]; y = dmat[:, 2]; z = dmat[:,3]; σ = dmat[:,4]
+        lines!(ax,y,x,z, color=z, linewidth=3, colorrange=(cte_low, cte_high))
+    end
+    σ_high = maximum(σ_maxs)
+    σ_low = minimum(σ_mins)
+    Colorbar(f[1,2], limits = (cte_low, cte_high))
+    return f
+end
+export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
 function single_cr_plot(cr, X, Y, θ; σ_n = 0.00011)
