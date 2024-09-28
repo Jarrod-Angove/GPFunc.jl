@@ -358,14 +358,22 @@ export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
 function single_cr_plot(cr, X, Y, θ; σ_n = 0.00011)
+axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
+                 ygridvisible=false, xminorticks=IntervalsBetween(2),
+                 yminorticks=IntervalsBetween(2),
+                 xminorticksvisible=true, yminorticksvisible=true, 
+                 xtickalign=0.5, ytickalign=0.5, 
+                 xticksize=10.0, yticksize=10.0, yminorticksize=5.0,
+                 xminorticksize=5.0)
     n = size(X, 1)
     xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
-    f = Figure()
-    ax = Axis(f[1,1], xlabel="Temp. (°C)", ylabel="dL/dT (μm/°C)", xreversed=true)
+    f = Figure(; size=(800,480))
+    ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
+              axis_kwargs...)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
-    band!(ax, xstars[5:end], lower, upper; alpha=0.4)
+    band!(ax, xstars[5:end], lower, upper; alpha=0.3)
     lines!(ax, xstars[5:end], means; label="CR = $cr (°C/s)")
     #axislegend(ax)
     return f, ax
@@ -380,7 +388,7 @@ function single_cr_plot!(cr, X, Y, θ; σ_n = 0.00011)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
-    band!(xstars[5:end], lower, upper; alpha=0.4)
+    band!(xstars[5:end], lower, upper; alpha=0.3)
     lines!(xstars[5:end], means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!

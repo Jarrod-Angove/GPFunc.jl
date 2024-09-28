@@ -1,6 +1,7 @@
 module GPFunc
 
 include("./testing.jl")
+include("./pres_plots.jl")
 #include("./testing_gpu.jl")
 
 
