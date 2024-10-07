@@ -1,17 +1,25 @@
 using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationOptimJL
 using Enzyme, GLMakie, Statistics, SpecialFunctions
 
-function pull_test_data()
-    trial_path = "../dil_data/dil_V3016_2014-02-17_canmet/"
+function pull_test_data(; t_cut = 0.0)
+    trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     trial = DilPredict.get_trial(trial_path)
-    # using 0.07 because it is slightly larger
-    # than the average dt in the original data for 3016
-    # TODO: Find some way to automate this
-    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, 0.07)
+    tsteps = trial.runs[1].time |> diff |> median
+    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps)
     X = hcat(T...)
     Y = hcat(dL...)
+    dLdT = hcat(dLdT...)
     dTdt = hcat(dTdt...)
-    return (X, Y, t, dTdt)
+
+    if t_cut != 0.0
+        ind = findall(t -> t>t_cut, t)
+        t = t[ind]
+        X = X[ind, :]
+        Y = Y[ind, :]
+        dTdt = dTdt[ind, :]
+        dLdT = dLdT[ind, :]
+    end
+    return (X, Y, t, dTdt, dLdT)
 end
 export pull_test_data
 
@@ -98,7 +106,6 @@ function T_dist(X::Matrix{Float64})::Array{Float64, 3}
 end
 export T_dist
 
-#TODO: Finish writing this to take two inputs
 function T_dist(X1, X2)
     n, N = size(X1)
     N2 = minimum(size(Matrix(X2')))
@@ -114,7 +121,6 @@ function exponentiated_kernel(D, σ, l)
 end
 export exponentiated_kernel
 
-# What's the difference between besselj and bessely?
 function matern_kernel(d, σ, l, ν)
     d = 2 - 2 * (d - 1e-8)
     y = sqrt(2*ν) * d
@@ -131,9 +137,7 @@ export exponentiated_kernel
 
 function signal_noise(D, σ_n)
     N, _, n = size(D)
-    noise_mat = diagm(ones(N)) .* σ_n
-    noise_T = repeat(noise_mat, 1,1, n)
-    return noise_T
+    return [i==j ? abs(σ_n) : 0 for i in 1:N, j in 1:N, k in 1:n]
 end
 export signal_noise
 
@@ -180,7 +184,7 @@ function nlogp(θ, D_hist, D_instant, Y; σ_n = 5.0)
     σ_inst = 1.0; l_inst = θ[3];
     K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, σ_n))
+        .+ signal_noise(D_hist, θ[4]))
     #nlogp_all = Vector{Float64}(undef,n)
     nlogp_all = 0.0
     for k in 1:n
@@ -201,8 +205,7 @@ function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
     σ_inst = 1.0; l_inst = θ[3];
     K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, σ_n))
-    #nlogp_all = Vector{Float64}(undef,n)
+        .+ signal_noise(D_hist, σ_n, θ[4], θ[5]))
     nlogp_all = Vector{Float64}(undef, n)
     for k in 1:n
         y = @view Y[k, :]
@@ -223,8 +226,8 @@ function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 0.00011)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[1e-6, 1e-6, 1e-6],
-                               ub=[1e8, 1e8, 1e8])
+    prob = OptimizationProblem(of, θi, [], lb=[1e-6, 1e-6, 1e-6, 1e-6],
+                               ub=[1e8, 1e3, 1e8, 1e2])
     sol = solve(prob, Optim.BFGS(); show_trace=true)
     return sol
 end 
@@ -243,6 +246,7 @@ function predict_y(X, X_star, Y, θ; σ_n = 5.0)
     D_star_inst = T_dist(X, X_star)
     σ_hist = θ[1]; l_hist = θ[2];
     σ_inst = 1.0; l_inst = θ[3];
+    σ_n = θ[4];
    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_instant, σ_inst, l_inst)
         .+ signal_noise(D_hist, σ_n))
@@ -285,16 +289,16 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
-function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.00011)
+function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25)
     n, N = size(X)
     rates = range(crate_min, crate_max; length=m)
     means = Matrix{Float64}(undef, n, m)
     vars = Matrix{Float64}(undef, n, m)
     xstars_T = Matrix{Float64}(undef, n, m)
     xstars_CR = Matrix{Float64}(undef, n, m)
-    Threads.@threads for i in eachindex(rates)
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(900.0, 30.0, rates[i], 0.07, n) 
-        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=0.00011)
+    Threads.@threads for i in 1:m
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(950.0, 200.0, rates[i], 0.3, n) 
+        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
     ax = Axis3(f[1,1];
@@ -326,8 +330,8 @@ function inference_surface_t(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.0001
     xstars_CR = Matrix{Float64}(undef, n, m)
 
     Threads.@threads for i in eachindex(rates)
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(900.0, 30.0, rates[i], 0.07, n) 
-        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=0.00011)
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(950.0, 205.0, rates[i], 0.3, n) 
+        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
     ax = Axis3(f[1,1];
@@ -366,7 +370,7 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xticksize=10.0, yticksize=10.0, yminorticksize=5.0,
                  xminorticksize=5.0)
     n = size(X, 1)
-    xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
+    xstars,_ = build_x_star(950.0, 200.0, cr, 0.3, n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
@@ -376,7 +380,7 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
     band!(ax, xstars[5:end], lower, upper; alpha=0.3)
     lines!(ax, xstars[5:end], means; label="CR = $cr (°C/s)")
     #axislegend(ax)
-    return f, ax
+    return f
 end
 export single_cr_plot
 
@@ -384,7 +388,7 @@ export single_cr_plot
 
 function single_cr_plot!(cr, X, Y, θ; σ_n = 0.00011)
     n = size(X, 1)
-    xstars,_ = build_x_star(900.0, 30.0, cr, 0.07, n)
+    xstars,_ = build_x_star(950.0, 200.0, cr, 0.3, n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
@@ -392,5 +396,3 @@ function single_cr_plot!(cr, X, Y, θ; σ_n = 0.00011)
     lines!(xstars[5:end], means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!
-
-#TODO: Implement Matern Kernel
