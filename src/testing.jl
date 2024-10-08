@@ -1,24 +1,43 @@
 using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationOptimJL
 using Enzyme, GLMakie, Statistics, SpecialFunctions
 
-function pull_test_data(; t_cut = 0.0)
-    trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
+function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/",
+                        T_start=1000.0, T_end=200.0, scrunch = false)
     trial = DilPredict.get_trial(trial_path)
+    f = Figure()
+    ax1 = Axis(f[1,1]; xlabel="Time (s)", ylabel="Temp (C)")
+    ax2 = Axis(f[1,2]; xlabel="Temp (C)", ylabel="ΔL (μm)")
+    for i in 1:length(trial.runs)
+        lines!(ax1, trial.runs[i].time, trial.runs[i].temp)
+        lines!(ax2, trial.runs[i].temp, trial.runs[i].dL)
+        hlines!(ax1, [T_start, T_end], color=:red)
+        vlines!(ax2, [T_start, T_end], color=:red)
+    end
+    println("Cooling range is currently set to:")
+    @show T_start
+    @show T_end
+    println("Please check the plot to make sure these are correct")
+    display(f)
     tsteps = trial.runs[1].time |> diff |> median
-    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps)
+    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps;
+                                                    T_start=T_start,
+                                                    T_end=T_end)
     X = hcat(T...)
     Y = hcat(dL...)
     dLdT = hcat(dLdT...)
     dTdt = hcat(dTdt...)
 
-    if t_cut != 0.0
-        ind = findall(t -> t>t_cut, t)
-        t = t[ind]
-        X = X[ind, :]
-        Y = Y[ind, :]
-        dTdt = dTdt[ind, :]
-        dLdT = dLdT[ind, :]
+    # Make all of the ΔLs at T_start the same (equal to mean)
+    if scrunch
+        N = size(Y,2)
+        ave_dLi = mean([Y[1, i] for i in 1:N])
+        for i in 1:N
+            delta = ave_dLi - Y[1, i]
+            @show delta
+            Y[:, i] = Y[:,i] .+ delta
+        end
     end
+
     return (X, Y, t, dTdt, dLdT)
 end
 export pull_test_data
@@ -178,7 +197,7 @@ function grad_nlogp(θ, D, Y)
 end
 export grad_nlogp
 
-function nlogp(θ, D_hist, D_instant, Y; σ_n = 5.0)
+function nlogp(θ, D_hist, D_instant, Y; σ_n = 1.0)
     N, _, n = size(D_hist)
     σ_hist = θ[1]; l_hist = θ[2];
     σ_inst = 1.0; l_inst = θ[3];
@@ -219,15 +238,15 @@ function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
 end
 export nlogp_slices
 
-function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 0.00011)
+function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 1.0)
     loss(θ, p) = nlogp(θ, D_hist, D_instant, Y; σ_n = σ_n)
     #function loss_grad!(storage::Array{Float64}, θ::Vector{Float64}, p)::Array{Float64}
     #    storage .= grad_nlogp(θ, D, Y)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[1e-6, 1e-6, 1e-6, 1e-6],
-                               ub=[1e8, 1e3, 1e8, 1e2])
+    prob = OptimizationProblem(of, θi, [], lb=[1e-6, 1e-6, 1e-6, 1e-9],
+                               ub=[1e8, 1e8, 1e8, 20.0])
     sol = solve(prob, Optim.BFGS(); show_trace=true)
     return sol
 end 
@@ -235,7 +254,7 @@ export opt_kernel
 # θi = [11.5, 0.7, 0.14]
 
 # TODO: Finish adding the inst kernel
-function predict_y(X, X_star, Y, θ; σ_n = 5.0)
+function predict_y(X, X_star, Y, θ; σ_n = 1.0)
     if size(X_star, 1) != size(X, 1) 
             throw("Dim of X_star dne dim of X")
     end
@@ -246,13 +265,12 @@ function predict_y(X, X_star, Y, θ; σ_n = 5.0)
     D_star_inst = T_dist(X, X_star)
     σ_hist = θ[1]; l_hist = θ[2];
     σ_inst = 1.0; l_inst = θ[3];
-    σ_n = θ[4];
    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, σ_n))
+        .+ signal_noise(D_hist, θ[4]))
     K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist) .*
         exponentiated_kernel(D_star_inst, σ_inst, l_inst)
-        .+ signal_noise(D_star_hist, σ_n))
+        .+ signal_noise(D_star_hist, θ[4]))
     k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist) .*
         exponentiated_kernel(1.0, σ_inst, l_inst))
 
@@ -289,7 +307,7 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
-function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25)
+function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25, T_start=860.0, T_end=250.0)
     n, N = size(X)
     rates = range(crate_min, crate_max; length=m)
     means = Matrix{Float64}(undef, n, m)
@@ -297,7 +315,7 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25)
     xstars_T = Matrix{Float64}(undef, n, m)
     xstars_CR = Matrix{Float64}(undef, n, m)
     Threads.@threads for i in 1:m
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(950.0, 200.0, rates[i], 0.3, n) 
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(T_start, T_end, rates[i], mean(diff(t)), n) 
         means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
@@ -312,7 +330,7 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25)
         z = means[:,i]
         σ = sqrt.(abs.(vars[:,i]))
         dmat = hcat(x,y,z, σ)
-        dmat = hcat([dmat[i, :] for i in 1:size(dmat,1) if dmat[i,1] > 40.0]...)'
+        dmat = hcat([dmat[i, :] for i in 1:size(dmat,1) if dmat[i,1] > T_end]...)'
         x = dmat[:, 1]; y = dmat[:, 2]; z = dmat[:,3]; σ = dmat[:,4]
         lines!(ax,x,y,z, color=σ, linewidth=3, colorrange=(σ_low, σ_high))
     end
@@ -330,7 +348,7 @@ function inference_surface_t(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.0001
     xstars_CR = Matrix{Float64}(undef, n, m)
 
     Threads.@threads for i in eachindex(rates)
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(950.0, 205.0, rates[i], 0.3, n) 
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(945, 205.0, rates[i], mean(diff(t)), n) 
         means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
@@ -361,7 +379,7 @@ end
 export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
-function single_cr_plot(cr, X, Y, θ; σ_n = 0.00011)
+function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t)
 axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  ygridvisible=false, xminorticks=IntervalsBetween(2),
                  yminorticks=IntervalsBetween(2),
@@ -370,7 +388,7 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xticksize=10.0, yticksize=10.0, yminorticksize=5.0,
                  xminorticksize=5.0)
     n = size(X, 1)
-    xstars,_ = build_x_star(950.0, 200.0, cr, 0.3, n)
+    xstars,_ = build_x_star(T_start, 80.0, cr, mean(diff(t)), n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
@@ -386,9 +404,9 @@ export single_cr_plot
 
 # θ = [29.674, 3.572, 426.479]
 
-function single_cr_plot!(cr, X, Y, θ; σ_n = 0.00011)
+function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t)
     n = size(X, 1)
-    xstars,_ = build_x_star(950.0, 200.0, cr, 0.3, n)
+    xstars,_ = build_x_star(T_start, 80.0, cr, mean(diff(t)), n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))

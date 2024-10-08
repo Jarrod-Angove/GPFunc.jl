@@ -429,7 +429,7 @@ version = "0.6.6"
 
 [[deps.DilPredict]]
 deps = ["AbstractGPs", "CairoMakie", "DSP", "DelimitedFiles", "Dierckx", "Enzyme", "ForwardDiff", "GLMakie", "Interpolations", "JLD2", "KernelFunctions", "LinearAlgebra", "NLopt", "Optim", "Optimization", "OptimizationOptimJL", "ParameterHandling", "Printf", "Random", "SavitzkyGolay", "Statistics", "Stheno", "TOML", "Zygote"]
-git-tree-sha1 = "3a17405de069ba4eca0cdbaa111c2b3c2b33f654"
+git-tree-sha1 = "0b3b1b1281a6ddd45cab0f56bb3302fff6b44b53"
 repo-rev = "master"
 repo-url = "../DilPredict"
 uuid = "a103a12c-0188-489c-a78d-3708ca4db92e"
