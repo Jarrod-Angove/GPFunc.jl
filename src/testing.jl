@@ -414,3 +414,4 @@ function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t)
     lines!(xstars[5:end], means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!
+
