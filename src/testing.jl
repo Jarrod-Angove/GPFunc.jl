@@ -18,7 +18,8 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     @show T_end
     println("Please check the plot to make sure these are correct")
     display(f)
-    tsteps = trial.runs[1].time |> diff |> median
+    tsteps = minimum([median(diff(i.time)) for i in trial.runs]) * 2
+    @show tsteps
     T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps;
                                                     T_start=T_start,
                                                     T_end=T_end)
@@ -415,3 +416,15 @@ function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t)
 end
 export single_cr_plot!
 
+function get_info(mypath)
+    trial = get_trial(mypath)
+    for i in 1:length(trial.runs)
+        data = get_cooling(trial.runs[i])
+        println("""
+                Name: $(data.name), 
+                dt = $(median(diff(data.time))),
+                N = $(length(data.time))
+                """)
+    end
+end
+export get_info
