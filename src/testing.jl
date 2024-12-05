@@ -2,23 +2,27 @@ using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationO
 using Enzyme, GLMakie, Statistics, SpecialFunctions
 
 function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/",
-                        T_start=1000.0, T_end=200.0, scrunch = false)
+                        T_start=1000.0, T_end=200.0, scrunch = false, check_plot=true, scaler=1)
     trial = DilPredict.get_trial(trial_path)
-    f = Figure()
-    ax1 = Axis(f[1,1]; xlabel="Time (s)", ylabel="Temp (C)")
-    ax2 = Axis(f[1,2]; xlabel="Temp (C)", ylabel="ΔL (μm)")
-    for i in 1:length(trial.runs)
-        lines!(ax1, trial.runs[i].time, trial.runs[i].temp)
-        lines!(ax2, trial.runs[i].temp, trial.runs[i].dL)
-        hlines!(ax1, [T_start, T_end], color=:red)
-        vlines!(ax2, [T_start, T_end], color=:red)
+
+    # Check to make sure everything lines up; can be disabled for dev work
+    if check_plot
+        f = Figure()
+        ax1 = Axis(f[1,1]; xlabel="Time (s)", ylabel="Temp (C)")
+        ax2 = Axis(f[1,2]; xlabel="Temp (C)", ylabel="ΔL (μm)")
+        for i in 1:length(trial.runs)
+            lines!(ax1, trial.runs[i].time, trial.runs[i].temp)
+            lines!(ax2, trial.runs[i].temp, trial.runs[i].dL)
+            hlines!(ax1, [T_start, T_end], color=:red)
+            vlines!(ax2, [T_start, T_end], color=:red)
+        end
+        println("Cooling range is currently set to:")
+        @show T_start
+        @show T_end
+        println("Please check the plot to make sure these are correct")
+        display(f)
     end
-    println("Cooling range is currently set to:")
-    @show T_start
-    @show T_end
-    println("Please check the plot to make sure these are correct")
-    display(f)
-    tsteps = minimum([median(diff(i.time)) for i in trial.runs]) * 2
+    tsteps = minimum([median(diff(i.time)) for i in trial.runs]) * scaler
     @show tsteps
     T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps;
                                                     T_start=T_start,
@@ -32,7 +36,7 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     if scrunch
         N = size(Y,2)
         ave_dLi = mean([Y[1, i] for i in 1:N])
-        for i in 1:N
+        Threads.@threads for i in 1:N
             delta = ave_dLi - Y[1, i]
             @show delta
             Y[:, i] = Y[:,i] .+ delta
@@ -63,7 +67,7 @@ function cos_dis(X)
     norms = Array{Float64}(undef, N,N,n)
     norms .= [normsX[k,i] * normsX[k,j] for i in 1:N, j in 1:N, k in 1:n] 
 
-    D = T ./ norms
+    D = sqrt.(abs.(2 .- 2 .* (T ./ norms)))
     
     return D
 end
@@ -99,7 +103,7 @@ function cos_dis(X1, X2)
         norms = Array{Float64}(undef, N,N2,n)
         norms .= [normsX1[k,i] * normsX2[k,j] for i in 1:N, j in 1:N2, k in 1:n] 
 
-        D = T ./ norms
+        D = sqrt.(abs.(2 .- 2 .* (T ./ norms)))
         
         return D
     end
@@ -135,8 +139,8 @@ function T_dist(X1, X2)
 end
 return T_dist
 
-function exponentiated_kernel(D, σ, l)
-    K = σ^2 .* exp.(D ./ l^2)
+function exponentiated_kernel(D, σ, l, β)
+    K = σ^2 .* exp.(-D.^β./ l^2)
     return K
 end
 export exponentiated_kernel
@@ -198,26 +202,37 @@ function grad_nlogp(θ, D, Y)
 end
 export grad_nlogp
 
-function nlogp(θ, D_hist, D_instant, Y; σ_n = 1.0)
+function nlogp(θ, D_hist, Y; σ_n = 1.0)
     N, _, n = size(D_hist)
-    σ_hist = θ[1]; l_hist = θ[2];
-    σ_inst = 1.0; l_inst = θ[3];
-    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
-        exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, θ[4]))
-    #nlogp_all = Vector{Float64}(undef,n)
-    nlogp_all = 0.0
-    for k in 1:n
+    σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
+    K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
+        .+ signal_noise(D_hist, σ_n))
+    nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
-        μ_X = mean(y)
+        μ_X = 0
         K_t = @view K[:,:,k]
         L = cholesky(K_t) 
         α = L.U \ (L.L \ (y .- μ_X))
-        nlogp_all += 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
-    end
-    return nlogp_all
+        0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
+        end
+    return sum(nlogp_all)/n
 end
 export nlogp
+
+function nlogp_threaded(θ, D_hist, Y; σ_n = 1.0)
+    n = size(D_hist, 3)
+    batch_ind = collect(
+        Iterators.partition(1:n, round(Int, n/Threads.nthreads())))
+    #Y_batch = [Y[batch_ind[i], :] for i in 1:Threads.nthreads()]
+    #D_batch = [D_hist[:, :, batch_ind[i]] for i in 1:Threads.nthreads()]
+    tasks = map(1:Threads.nthreads()) do k 
+        Threads.@spawn nlogp(θ, D_hist[:,:,batch_ind[k]],
+                             Y[batch_ind[k],:]; σ_n = σ_n)
+    end
+    chunk_sums = fetch.(tasks)
+    return sum(chunk_sums)/Threads.nthreads()
+end
+export nlogp_threaded
 
 function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
     N, _, n = size(D_hist)
@@ -239,15 +254,15 @@ function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
 end
 export nlogp_slices
 
-function opt_kernel(θi, D_hist, D_instant, Y; σ_n = 1.0)
-    loss(θ, p) = nlogp(θ, D_hist, D_instant, Y; σ_n = σ_n)
+function opt_kernel(θi, D_hist, Y; σ_n = 1.0)
+    loss(θ, p) = nlogp_threaded(θ, D_hist, Y; σ_n = σ_n)
     #function loss_grad!(storage::Array{Float64}, θ::Vector{Float64}, p)::Array{Float64}
     #    storage .= grad_nlogp(θ, D, Y)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[1e-6, 1e-6, 1e-6, 1e-9],
-                               ub=[1e8, 1e8, 1e8, 20.0])
+    prob = OptimizationProblem(of, θi, [], lb=[1.0e-6, 1.0e-6, 0.8],
+                               ub=[20.0, 100.0, 2.0])
     sol = solve(prob, Optim.BFGS(); show_trace=true)
     return sol
 end 
@@ -260,27 +275,21 @@ function predict_y(X, X_star, Y, θ; σ_n = 1.0)
             throw("Dim of X_star dne dim of X")
     end
     n, N = size(X)
-    D_instant = T_dist(X)
     D_hist = cos_dis(X)
     D_star_hist = cos_dis(X, X_star)
-    D_star_inst = T_dist(X, X_star)
-    σ_hist = θ[1]; l_hist = θ[2];
-    σ_inst = 1.0; l_inst = θ[3];
-   K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
-        exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, θ[4]))
-    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist) .*
-        exponentiated_kernel(D_star_inst, σ_inst, l_inst)
-        .+ signal_noise(D_star_hist, θ[4]))
-    k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist) .*
-        exponentiated_kernel(1.0, σ_inst, l_inst))
+    σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
+    K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
+        .+ signal_noise(D_hist, σ_n))
+    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist, β_hist) 
+        .+ signal_noise(D_star_hist, σ_n))
+    k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist, β_hist))
 
     μ = Vector{Float64}(undef, n)
     s = Vector{Float64}(undef, n)
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
-        μ_X = mean(y)
+        μ_X = 0
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
         # Assume that μ_* = μ_X:
@@ -389,7 +398,7 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xticksize=10.0, yticksize=10.0, yminorticksize=5.0,
                  xminorticksize=5.0)
     n = size(X, 1)
-    xstars,_ = build_x_star(T_start, 80.0, cr, mean(diff(t)), n)
+    xstars,_ = build_x_star(T_start, 100.0, cr, mean(diff(t)), n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
@@ -407,7 +416,7 @@ export single_cr_plot
 
 function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t)
     n = size(X, 1)
-    xstars,_ = build_x_star(T_start, 80.0, cr, mean(diff(t)), n)
+    xstars,_ = build_x_star(T_start, 100.0, cr, mean(diff(t)), n)
     means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
