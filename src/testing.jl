@@ -297,7 +297,7 @@ export opt_kernel
 # θi = [11.5, 0.7, 0.14]
 
 # TODO: Finish adding the inst kernel
-function predict_y(X, X_star, Y, θ; σ_n = 1.0)
+function gp_inference(X, X_star, Y, θ; σ_n = 1.0)
     if size(X_star, 1) != size(X, 1) 
             throw("Dim of X_star dne dim of X")
     end
@@ -325,7 +325,7 @@ function predict_y(X, X_star, Y, θ; σ_n = 1.0)
     end
     return μ, s
 end
-export predict_y
+export gp_inference
 
 function build_x_star(Tstart, Tstop, rate, dt, n)
     temps = [Tstart,] 
@@ -354,7 +354,7 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ;
     xstars_CR = Matrix{Float64}(undef, n, m)
     Threads.@threads for i in 1:m
         xstars_T[:, i], xstars_CR[:,i] = build_x_star(T_start, T_end, rates[i], mean(diff(t)), n) 
-        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
+        means[:, i], vars[:, i] = gp_inference(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
     ax = Axis3(f[1,1];
@@ -387,7 +387,7 @@ function inference_surface_t(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.0001
 
     Threads.@threads for i in eachindex(rates)
         xstars_T[:, i], xstars_CR[:,i] = build_x_star(945, 205.0, rates[i], mean(diff(t)), n) 
-        means[:, i], vars[:, i] = predict_y(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
+        means[:, i], vars[:, i] = gp_inference(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
     ax = Axis3(f[1,1];
@@ -427,7 +427,7 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xminorticksize=5.0)
     n = size(X, 1)
     xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
-    means, vars = predict_y(X, xstars, Y, θ; σ_n = σ_n)
+    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
               axis_kwargs...)
@@ -445,7 +445,7 @@ export single_cr_plot
 function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t; T_end=250.0)
     n = size(X, 1)
     xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
-    means, vars = predict_y(X, xstars, Y, θ; σ_n = σ_n)
+    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
     band!(xstars, lower, upper; alpha=0.3)
