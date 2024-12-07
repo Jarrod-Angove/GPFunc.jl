@@ -1,5 +1,5 @@
-using LinearAlgebra, KernelAbstractions, DilPredict, Optimization, OptimizationOptimJL
-using Enzyme, GLMakie, Statistics, SpecialFunctions
+using LinearAlgebra, DilPredict, Optimization, OptimizationOptimJL
+using GLMakie, Statistics, SpecialFunctions
 
 function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/",
                         T_start=1000.0, T_end=200.0, scrunch = false, check_plot=true, scaler=1)
@@ -47,6 +47,12 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     return (X, Y, t, dTdt, dLdT, f)
 end
 export pull_test_data
+
+################################################
+#
+# DISTANCE METRICS
+#
+###############################################
 
 # Get distance matrix/tensor from data set using cosine distance metric
 function cos_dis(X::AbstractMatrix{<:AbstractFloat})
@@ -137,13 +143,14 @@ function cos_dis(X1, X2)
 end
 export cos_dis
 
+# squared euclidean distance for non-historetic kernels
 function T_dist_i(X_i::Vector{Float64})::Matrix{Float64}
-    return [-(i - j)^2 for i in X_i, j in X_i]
+    return [(i - j)^2 for i in X_i, j in X_i]
 end
 export T_dist_i
 
 function T_dist_i(X1::Vector{Float64}, X2::Vector{Float64})::Matrix{Float64}
-    return [-(i - j)^2 for i in X1, j in X2]
+    return [(i - j)^2 for i in X1, j in X2]
 end
 export T_dist_i
 
@@ -166,6 +173,12 @@ function T_dist(X1, X2)
 end
 return T_dist
 
+################################################
+#
+# KERNEL FUNCTIONS
+#
+###############################################
+
 function exponentiated_kernel(D, σ, l, β)
     K = σ^2 .* exp.(-D.^β./ l^2)
     return K
@@ -178,57 +191,43 @@ function matern_kernel(d, σ, l, ν)
 end
 export matern_kernel
 
-function exponentiated_kernel_dual(D_T, D_CR, l_T, l_CR)
-    K_T = exp.(D_T ./ l_T^2)
-    K_CR = exp.(D_CR ./ l_CR^2)
-    return K_T + K_CR
-end
-export exponentiated_kernel
-
 function signal_noise(D, σ_n)
     N, _, n = size(D)
     return [i==j ? abs(σ_n) : 0 for i in 1:N, j in 1:N, k in 1:n]
 end
 export signal_noise
 
-# Returns gradient of exponentiated kernel function
-# This is pretty slow because it needs to calculate the
-# kernel three times... This would be a really good spot to 
-# start running stuff on GPU.
-function grad_expo(θ, D)
-    N,_,n = size(D)
-    k = exp.(D ./ θ[2]^2)
-    g_σf = 2 .* θ[1] .* k
-    g_l = (-2 .* D .* θ[1]^2) ./ θ[2]^3 .* k
-    g_σn = repeat(diagm(ones(N)), 1, 1, n)
-    return [g_σf, g_l, g_σn]
-end
-export grad_expo
+################################################
+#
+# TRAINING
+#
+###############################################
 
-function grad_nlogp(θ, D, Y)
-    N, _, n = size(D)
-    len_θ = length(θ)
-    σ = θ[1]; l = θ[2]; σ_n = θ[3]
-    K = exponentiated_kernel(D, σ, l) .+ signal_noise(D, σ_n)
-    K_grads = grad_expo(θ, D)
-    #nlogp_all = Vector{Float64}(undef, n)
-    Gnlogp_tot = zeros(Float32, len_θ)
-    for k in 1:n
-        y = @view Y[k, :]
-        K_t = @view K[:,:,k]
-        L = cholesky(K_t) 
-        α = L.U \ (L.L \ y)
-        #nlogp_all[k] = 0.5 * (y'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
-        @views for m in 1:len_θ
-            G_t = K_grads[m][:,:,k]
-            Gnlogp_tot[m] += -0.5 * tr(α * α' * G_t - L.U \ (L.L \ G_t))
-        end
-    end
-    return Gnlogp_tot
-end
-export grad_nlogp
+"""
+    nlogp(θ, D_hist, Y; σ_n = 1e-8)::Float64
 
-function nlogp(θ, D_hist, Y; σ_n = 1.0)
+Negative log marginal likelihood. `θ` is the kernel parameters,
+`D_hist` is the distance tensor, and `Y` is the reponse matrix. 
+`σ_n` is the signal noise (standard deviation) -- this represents
+any noise that is inherent to the measurement of the reponse variable. 
+This should not be treated as an optimizer variable because it creates 
+a non-identifiable system; the GP does not know how to discriminate 
+between latent function variance and signal variance. The default value
+of `σ_n = 1e-8` assumes that the signal noise is negligible. 
+
+This is calculated by treating
+each slice of the distance tensor as its own gaussian process.
+Time steps are only connected by the historetic property of the
+cosine distance metric. The final value is calculated by taking 
+the average nlogp across all slices -- this makes it easier
+to interpret when running optimizations on data with different
+time steps. 
+
+Individual slices are calculated according to the algorithm
+proposed by K. P. Murphy in 'Probabilistic Machine learning' 
+page 572. ISBN: 978-0-262-04682-4
+"""
+function nlogp(θ, D_hist, Y; σ_n = 1.0)::Float64
     N, _, n = size(D_hist)
     σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
     K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
@@ -245,7 +244,16 @@ function nlogp(θ, D_hist, Y; σ_n = 1.0)
 end
 export nlogp
 
-function nlogp_threaded(θ, D_hist, Y; σ_n = 1.0)
+"""
+    nlogp_threaded(θ, D_hist, Y; σ_n = 1e-8)
+
+A mulithreaded version of the `nlogp` function. This works
+by splitting the kernel into a chunks; average nlogp is 
+calculated for each chunk by individual threads, then these
+averages are averaged over the chunks to find the complete
+average nlogp. 
+"""
+function nlogp_threaded(θ, D_hist, Y; σ_n = 1e-8)
     n = size(D_hist, 3)
     batch_ind = collect(
         Iterators.partition(1:n, round(Int, n/Threads.nthreads())))
@@ -280,12 +288,18 @@ function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
 end
 export nlogp_slices
 
-function opt_kernel(θi, D_hist, Y; σ_n = 1.0)
+"""
+    opt_kernel(θi, D_hist; σ_n = 1e-8)
+
+Find optimial kernel parameters by minimizing 
+the negative log marginal likelihood `nlogp`. 
+`θi` are the initial parameters, `D_hist` is the 
+distance tensor, `Y` is the response matrix, `σ_n` 
+is the signal noise. 
+"""
+function opt_kernel(θi, D_hist, Y; σ_n = 1e-8)
     loss(θ, p) = nlogp_threaded(θ, D_hist, Y; σ_n = σ_n)
-    #function loss_grad!(storage::Array{Float64}, θ::Vector{Float64}, p)::Array{Float64}
-    #    storage .= grad_nlogp(θ, D, Y)
-    #end
-    #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
+
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
     prob = OptimizationProblem(of, θi, [], lb=[1.0e-8, 1.0e-6, 0.1],
                                ub=[50.0, 100.0, 2.0])
@@ -293,7 +307,12 @@ function opt_kernel(θi, D_hist, Y; σ_n = 1.0)
     return sol
 end 
 export opt_kernel
-# θi = [11.5, 0.7, 0.14]
+
+################################################
+#
+# INFERENCE
+#
+###############################################
 
 # TODO: Finish adding the inst kernel
 function gp_inference(X, X_star, Y, θ; σ_n = 1.0)
@@ -326,6 +345,13 @@ function gp_inference(X, X_star, Y, θ; σ_n = 1.0)
 end
 export gp_inference
 
+"""
+    build_x_star(Tstart, Tstop, rate, dt, n)
+
+Build an input thermal history for inference using a constant cooling 
+rate `rate`, time step `dt`, start and stop temperatures `Tstart` and `Tstop`,
+and length `n`.
+"""
 function build_x_star(Tstart, Tstop, rate, dt, n)
     temps = [Tstart,] 
     crates = [rate,]
@@ -342,6 +368,18 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
+"""
+    inference_surface(crate_max, crate_min, m, X, Y, t, θ)
+
+Generates a 3D plot of the response variable (ΔL or f usually) as a function 
+of temperature and cooling rate by running inference on a GP model. `crate_max`
+is the fastest cooling rate and `crate_min` is the slowest. `X` is the input 
+matrix, `Y` is the reponse matrix, `t` is the time basis (used to calculate dt),
+and `θ` is the vector of model parameters used to run the GP. `m` is the number 
+of 'points' that will be evaluated between the cooling rates; it determines the 
+number of input histories that will be evaluated. If `m = 50`, the model will 
+be evaluated for 50 thermal histories between `crate_min` and `crate_max`
+"""
 function inference_surface(crate_max, crate_min, m, X, Y, t, θ;
                            σ_n = 0.25, T_start=860.0, T_end=250.0)
     GLMakie.activate!()
@@ -351,8 +389,9 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ;
     vars = Matrix{Float64}(undef, n, m)
     xstars_T = Matrix{Float64}(undef, n, m)
     xstars_CR = Matrix{Float64}(undef, n, m)
+    dt = mean(diff(t))
     Threads.@threads for i in 1:m
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(T_start, T_end, rates[i], mean(diff(t)), n) 
+        xstars_T[:, i], xstars_CR[:,i] = build_x_star(T_start, T_end, rates[i], dt, n) 
         means[:, i], vars[:, i] = gp_inference(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
     end
     f = Figure()
@@ -438,8 +477,6 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
     return f
 end
 export single_cr_plot
-
-# θ = [29.674, 3.572, 426.479]
 
 function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t; T_end=250.0)
     n = size(X, 1)
