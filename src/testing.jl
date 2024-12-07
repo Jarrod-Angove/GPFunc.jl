@@ -33,8 +33,7 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     dTdt = hcat(regpack.dTdt...)
     f = hcat(regpack.f...)
     t = regpack.t
-
-    # Make all of the ΔLs at T_start the same (equal to mean)
+# Make all of the ΔLs at T_start the same (equal to mean)
     if scrunch
         N = size(Y,2)
         ave_dLi = mean([Y[1, i] for i in 1:N])
@@ -446,7 +445,7 @@ function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t; T_end=250.0)
     n = size(X, 1)
     xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
     means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
-    lower = means .- sqrt.(abs.(vars))
+    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
     upper = means .+ sqrt.(abs.(vars))
     band!(xstars, lower, upper; alpha=0.3)
     lines!(xstars, means, label="CR = $cr (°C/s)")
