@@ -22,15 +22,17 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
         println("Please check the plot to make sure these are correct")
         display(f)
     end
+
+    # Regularizing the data and pulling out features
     tsteps = minimum([median(diff(i.time)) for i in trial.runs]) * scaler
     @show tsteps
-    T, dL, t, _, dTdt, dLdT = DilPredict.regularize(trial, tsteps;
-                                                    T_start=T_start,
-                                                    T_end=T_end)
-    X = hcat(T...)
-    Y = hcat(dL...)
-    dLdT = hcat(dLdT...)
-    dTdt = hcat(dTdt...)
+    regpack = DilPredict.regularize(trial, tsteps; T_start=T_start, T_end=T_end)
+    X = hcat(regpack.T...)
+    Y = hcat(regpack.dL...)
+    dLdT = hcat(regpack.dLdT...)
+    dTdt = hcat(regpack.dTdt...)
+    f = hcat(regpack.f...)
+    t = regpack.t
 
     # Make all of the ΔLs at T_start the same (equal to mean)
     if scrunch
@@ -43,13 +45,39 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
         end
     end
 
-    return (X, Y, t, dTdt, dLdT)
+    return (X, Y, t, dTdt, dLdT, f)
 end
 export pull_test_data
 
 # Get distance matrix/tensor from data set using cosine distance metric
-function cos_dis(X)
+function cos_dis(X::AbstractMatrix{<:AbstractFloat})
     n, N = size(X)
+    T = Array{Float64}(undef, N,N,n)
+    T .= [X[k, i] * X[k, j] for i in 1:N, j in 1:N, k in 1:n]
+    @views for k in 2:n
+        T[:, :, k] .= T[:, :, k] .+ T[:, :, k-1]
+    end
+
+    # This is the slow part! Very poorly optimized
+    normsX = Matrix{Float64}(undef, n,N)
+    Threads.@threads for i in 1:N
+        for k in 1:n
+        x = @view X[1:k, i]
+        normsX[k, i] = norm(x)
+        end
+    end
+    norms = Array{Float64}(undef, N,N,n)
+    norms .= [normsX[k,i] * normsX[k,j] for i in 1:N, j in 1:N, k in 1:n] 
+
+    D = sqrt.(abs.(2 .- 2 .* (T ./ norms)))
+    
+    return D
+end
+export cos_dis
+
+function cos_dis(X::AbstractVector{<:AbstractFloat})
+    n = length(X)
+    N = 1
     T = Array{Float64}(undef, N,N,n)
     T .= [X[k, i] * X[k, j] for i in 1:N, j in 1:N, k in 1:n]
     @views for k in 2:n
@@ -146,9 +174,8 @@ end
 export exponentiated_kernel
 
 function matern_kernel(d, σ, l, ν)
-    d = 2 - 2 * (d - 1e-8)
-    y = sqrt(2*ν) * d
-    σ^2 * (2^(1-ν))/(gamma(1.5)) * (y/l)^ν * besselk(ν, y/l)
+    y = sqrt(2*ν) .* d
+    σ^2 .* (2^(1 .- ν))./(gamma(ν)) .* (y./l).^ν .* besselk.(ν, y ./ l)
 end
 export matern_kernel
 
@@ -209,7 +236,7 @@ function nlogp(θ, D_hist, Y; σ_n = 1.0)
         .+ signal_noise(D_hist, σ_n))
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
-        μ_X = 0
+        μ_X = 1.0
         K_t = @view K[:,:,k]
         L = cholesky(K_t) 
         α = L.U \ (L.L \ (y .- μ_X))
@@ -261,8 +288,8 @@ function opt_kernel(θi, D_hist, Y; σ_n = 1.0)
     #end
     #loss_grad!(θ, _p) = grad_nlogp(θ, D, Y)
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[1.0e-6, 1.0e-6, 0.8],
-                               ub=[20.0, 100.0, 2.0])
+    prob = OptimizationProblem(of, θi, [], lb=[1.0e-8, 1.0e-6, 0.1],
+                               ub=[50.0, 100.0, 2.0])
     sol = solve(prob, Optim.BFGS(); show_trace=true)
     return sol
 end 
@@ -280,22 +307,21 @@ function predict_y(X, X_star, Y, θ; σ_n = 1.0)
     σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
     K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
         .+ signal_noise(D_hist, σ_n))
-    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist, β_hist) 
-        .+ signal_noise(D_star_hist, σ_n))
-    k_ss = (exponentiated_kernel(1.0, σ_hist, l_hist, β_hist))
+    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist, β_hist))
+    k_ss = vec(exponentiated_kernel(cos_dis(X_star), σ_hist, l_hist, β_hist))
 
     μ = Vector{Float64}(undef, n)
     s = Vector{Float64}(undef, n)
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
-        μ_X = 0
+        μ_X = 1.0
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
         # Assume that μ_* = μ_X:
         μ[k] = μ_X .+ (K_star_t' * (L.U\(L.L\(y .- μ_X))))[1]
         ν = (L.L \ K_star_t)
-        s[k] = k_ss - (ν' * ν)[1]
+        s[k] = k_ss[k] - (ν' * ν)[1]
     end
     return μ, s
 end
@@ -317,7 +343,9 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
-function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25, T_start=860.0, T_end=250.0)
+function inference_surface(crate_max, crate_min, m, X, Y, t, θ;
+                           σ_n = 0.25, T_start=860.0, T_end=250.0)
+    GLMakie.activate!()
     n, N = size(X)
     rates = range(crate_min, crate_max; length=m)
     means = Matrix{Float64}(undef, n, m)
@@ -332,20 +360,20 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ; σ_n = 0.25, T_
     ax = Axis3(f[1,1];
                xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="ΔL (μm)")
 
-    σ_high = maximum(sqrt.(abs.(vars)))
-    σ_low = minimum(sqrt.(abs.(vars)))
+    σ_high = maximum(sqrt.(vars))
+    σ_low = minimum(sqrt.(vars))
     for i in 1:m
         y = xstars_CR[:, i]
         x = xstars_T[:, i]
         z = means[:,i]
-        σ = sqrt.(abs.(vars[:,i]))
+        σ = sqrt.(vars[:,i])
         dmat = hcat(x,y,z, σ)
         dmat = hcat([dmat[i, :] for i in 1:size(dmat,1) if dmat[i,1] > T_end]...)'
         x = dmat[:, 1]; y = dmat[:, 2]; z = dmat[:,3]; σ = dmat[:,4]
         lines!(ax,x,y,z, color=σ, linewidth=3, colorrange=(σ_low, σ_high))
     end
     Colorbar(f[1,2], limits = (σ_low, σ_high))
-    return f
+    display(f)
 end
 export inference_surface
 
@@ -389,7 +417,7 @@ end
 export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
-function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t)
+function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t; T_end = 250.0)
 axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  ygridvisible=false, xminorticks=IntervalsBetween(2),
                  yminorticks=IntervalsBetween(2),
@@ -398,15 +426,15 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xticksize=10.0, yticksize=10.0, yminorticksize=5.0,
                  xminorticksize=5.0)
     n = size(X, 1)
-    xstars,_ = build_x_star(T_start, 100.0, cr, mean(diff(t)), n)
-    means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
+    xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
+    means, vars = predict_y(X, xstars, Y, θ; σ_n = σ_n)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
               axis_kwargs...)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
-    band!(ax, xstars[5:end], lower, upper; alpha=0.3)
-    lines!(ax, xstars[5:end], means; label="CR = $cr (°C/s)")
+    band!(ax, xstars, lower, upper; alpha=0.3)
+    lines!(ax, xstars, means; label="CR = $cr (°C/s)")
     #axislegend(ax)
     return f
 end
@@ -414,14 +442,14 @@ export single_cr_plot
 
 # θ = [29.674, 3.572, 426.479]
 
-function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t)
+function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t; T_end=250.0)
     n = size(X, 1)
-    xstars,_ = build_x_star(T_start, 100.0, cr, mean(diff(t)), n)
-    means, vars = predict_y(X[5:end, :], xstars[5:end], Y[5:end, :], θ; σ_n = σ_n)
+    xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
+    means, vars = predict_y(X, xstars, Y, θ; σ_n = σ_n)
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
-    band!(xstars[5:end], lower, upper; alpha=0.3)
-    lines!(xstars[5:end], means, label="CR = $cr (°C/s)")
+    band!(xstars, lower, upper; alpha=0.3)
+    lines!(xstars, means, label="CR = $cr (°C/s)")
 end
 export single_cr_plot!
 

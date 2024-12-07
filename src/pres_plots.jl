@@ -61,6 +61,7 @@ export get_average_CR
 
 function ΔL_plot(X, Y, dTdt; obfuscate = false)
     CairoMakie.activate!()
+    set_theme!(fontsize = 12, fonts = (; regular = "Libertinus Serif"))
     inch = 96; pt = 4/3;
     f = Figure(size = (7.5inch, 4.5inch), fontsize=12pt)
     N = size(Y, 2)
@@ -87,6 +88,36 @@ function ΔL_plot(X, Y, dTdt; obfuscate = false)
     return f
 end
 export ΔL_plot
+
+function f_trans_plot(X, Y, dTdt; obfuscate = false)
+    CairoMakie.activate!()
+    set_theme!(fontsize = 12, fonts = (; regular = "Libertinus Serif"))
+    inch = 96; pt = 4/3;
+    f = Figure(size = (7.5inch, 4.5inch), fontsize=12pt)
+    N = size(Y, 2)
+    ax = Axis(f[1,1]; xlabel="Temperature (°C)",
+              ylabel="Fraction Transformed", axis_kwargs..., xreversed = true)
+    CRvec = get_average_CR(X, dTdt)
+    Tmax = maximum(X)
+
+    if obfuscate
+        ax.xtickformat = x -> string.(round.(x./Tmax, sigdigits=2))
+        ax.xlabel = "Temperature (scaled)"
+    end
+
+    #colors = range(colorant"red", stop=colorant"blue", length=size(X,2))
+    #styles = [:dot, :dash, :solid, :dashdot, :dashdotdot, :solid, :dot]
+    #labels = ["A", "B", "C", "D", "E", "F", "G"]
+    for i in sortperm(CRvec)
+        color = weighted_color_mean(log(CRvec[i] + 1)/log(maximum(CRvec) + 1),
+                                    colorant"red", colorant"blue")
+        lines!(ax, X[:,i], Y[:,i]; linestyle=:solid, color=color,
+               label="CR = $(CRvec[i]) °C/s")
+    end
+    axislegend(ax, position=:rb, framevisible=false)
+    return f
+end
+export f_trans_plot
 
 function hprof_gen(rates, t, X)
     n, N = size(X)

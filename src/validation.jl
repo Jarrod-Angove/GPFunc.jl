@@ -35,7 +35,7 @@ function kfolds_pretrained(X, Y, θ; metric=rmse, k=6, σ_n)
 end
 export kfolds_pretrained
 
-function hot_one_out_retrained(X, Y; metric=rmse, σ_n=0.1^2)
+function hot_one_out_retrained(θ_init, X, Y; metric=rmse, σ_n=0.1^2)
     n_samples = size(X,2)
     all_ind = collect(1:n_samples)
     errors = Vector{Float64}(undef, n_samples)
@@ -45,11 +45,11 @@ function hot_one_out_retrained(X, Y; metric=rmse, σ_n=0.1^2)
         train_ind = [j for j in all_ind if j ≠ i]
         @show train_ind
         D = cos_dis(X[:, train_ind])
-        sol = opt_kernel([16.0, 0.5, 1.0], D, Y[:, train_ind]; σ_n = σ_n)
+        sol = opt_kernel(θ_init, D, Y[:, train_ind]; σ_n = σ_n)
         θ = sol.u
 
         # Only use temps greater than 200 for the comparison
-        comp_ind = [m for m in 1:size(X,1) if X[m, i] > 200]
+        comp_ind = [m for m in 1:size(X,1) if X[m, i] > 100]
 
         y_true = Y[:, test_ind]
         y_pred, _ = predict_y(X[:, train_ind], X[:, test_ind],
