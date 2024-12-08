@@ -257,7 +257,7 @@ export full_K_dists
 ###############################################
 
 function exponentiated_kernel(D, l, β)
-    K = exp.(-D.^β./ l^2)
+    K = β^2 .* exp.(-D ./ l^2)
     return K
 end
 export exponentiated_kernel
@@ -277,14 +277,14 @@ function signal_noise(D, σ_n)
 end
 export signal_noise
 
-function K_joined(tensor_of_dist_tensors, σ, l_vec, β_vec)
+function K_joined(tensor_of_dist_tensors, l_vec, β_vec)
     n, _, N, H = size(tensor_of_dist_tensors)
     kernels = map(1:H) do i
         K = exponentiated_kernel(
             tensor_of_dist_tensors[:,:,:,i], l_vec[i], β_vec[i])
     end
     # σ acts as a scaling factor to capture latent variance
-    return σ^2 .* sum(kernels)
+    return sum(kernels)
 end
 export K_joined
 
@@ -324,11 +324,11 @@ page 572. ISBN: 978-0-262-04682-4
 """
 function nlogp(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
     N,_,n, H = size(tensor_of_dist_tensors)
-    σ = θ[1];
-    l_β_mat = reshape(θ[2:end], (2, H))
+    #σ = θ[1];
+    l_β_mat = reshape(θ, (2, H))
     l_vec = l_β_mat[1, :]
     β_vec = l_β_mat[2, :]
-    K = (K_joined(tensor_of_dist_tensors, σ, l_vec, β_vec)
+    K = (K_joined(tensor_of_dist_tensors, l_vec, β_vec)
         .+ signal_noise(tensor_of_dist_tensors[:,:,:,1], σ_n))
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
@@ -399,28 +399,22 @@ is the signal noise.
 function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8)
     N, _, n, n_f = size(tensor_of_dist_tensors)
     loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
-
-    lower_bounds = vcat(1e-6, 
-                        repeat([1.0e-6, 1e-6], n_f))
-    upper_bounds = vcat(50,  
-                        repeat([1e6, 2.0], n_f))
+    lower_bounds = repeat([0.01, 0.0], n_f)
+    upper_bounds = repeat([200, 200.0], n_f)
 
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
     prob = OptimizationProblem(of, θi, [], lb=lower_bounds,
                                ub=upper_bounds)
     function cb(p, l)
         θ_inst = p.u
-        σ = θ_inst[1]
-        θ_mat = reshape(θ_inst[2:end], (2, n_f))
-        println("σ:")
-        display(σ)
+        θ_mat = reshape(θ_inst, (2, n_f))
         println("l and β:")
         display(θ_mat)
         println("loss: ")
         display(l)
         return false
     end
-    sol = solve(prob, Optim.BFGS(); show_trace=false, callback=cb, time_limit=2000)
+    sol = solve(prob, Optim.BFGS(); show_trace=false, callback=cb, time_limit=1000)
     return sol
 end 
 export opt_kernel
@@ -441,18 +435,16 @@ function gp_inference(dist_tensor_XX, dist_tensor_sX, dist_tensor_ss,
     N, _, n, H = size(dist_tensor_XX)
     M = size(dist_tensor_ss, 2)         # M = # of inference points
 
-    σ = θ[1]
-    θ_mat = reshape(θ[2:end], (2, H))
+    θ_mat = reshape(θ, (2, H))
     l_vec = θ_mat[1,:]
     β_vec = θ_mat[2,:]
 
-    K = (K_joined(dist_tensor_XX, σ, l_vec, β_vec)
+    K = (K_joined(dist_tensor_XX, l_vec, β_vec)
         .+ signal_noise(dist_tensor_XX[:,:,:,1], σ_n))
-    K_star = K_joined(dist_tensor_sX, σ, l_vec, β_vec)
-    k_ss = (K_joined(dist_tensor_ss, σ, l_vec, β_vec))
+    K_star = K_joined(dist_tensor_sX, l_vec, β_vec)
+    k_ss = (K_joined(dist_tensor_ss, l_vec, β_vec))
 
     μ = Matrix{Float64}(undef, n, M)
-    @show size(μ)
     s = Matrix{Float64}(undef, n, M)
     for k in 1:n
         K_t = K[:,:,k]
@@ -527,10 +519,16 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ, tcpath;
     vars = Matrix{Float64}(undef, n, m)
     dt = mean(diff(t))
 
+    println("Building inference points...")
     xstars_T, xstars_CR = build_x_star(T_start, T_end, rates, dt, n)
+
+    println("Calculating distance tensors...")
     dists = full_K_dists(X, xstars_T, tcpath; features=features)
+
+    println("Running infrence...")
     means, vars = gp_inference(dists..., Y, θ)
 
+    println("Plotting...")
     f = Figure()
     ax = Axis3(f[1,1];
                xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="ΔL (μm)")
@@ -618,11 +616,14 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
 end
 export single_cr_plot
 
-function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t; T_end=250.0)
+function single_cr_plot!(cr, X, Y, θ, σ_n, T_start, t, tcpath; T_end=250.0, features=[])
     n = size(X, 1)
     xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
-    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
-    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
+    dists = full_K_dists(X, xstars, tcpath; features = features)
+    means, vars = gp_inference(dists..., Y, θ; σ_n = σ_n)
+    means = vec(means)
+    vars = vec(vars)
+    lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
     band!(xstars, lower, upper; alpha=0.3)
     lines!(xstars, means, label="CR = $cr (°C/s)")

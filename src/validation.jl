@@ -1,13 +1,25 @@
 # This file contains code for validating/testing the model
+using Statistics
 
 # Root mean squared error
 rmse(y_true, y_pred) = sqrt(mean((y_true .- y_pred).^2))
 export rmse
 
+function R_sq(y_true, y_pred)
+    ȳ = mean(y_true)
+    SS_res = sum((y_true .- y_pred).^2)
+    SS_tot = sum((y_true .- ȳ).^2)
+    R² = 1 .- SS_res ./ SS_tot
+    return 
+end
+
 # TODO: Find a better measure of accuracy that utilizes likelihood
 
 # K-folds test based on pre-trained parameters
-function kfolds_pretrained(X, Y, θ; metric=rmse, k=6, σ_n)
+function kfolds_pretrained(dists, Y, θ, tcpath; metric=rmse, k=0, σ_n, features=[])
+    if k = 0 
+        k = size(dists[1], 2)
+    end
     n_samples = size(X,2)
     @assert n_samples % k == 0
     test_size = Int(n_samples/k)    # number of samples in the validation group
@@ -21,8 +33,9 @@ function kfolds_pretrained(X, Y, θ; metric=rmse, k=6, σ_n)
         @show test_ind
         @show train_ind
         for m in test_ind
+            dists = full_K_dists(X[:, train_ind], X[:, test_ind], tcpath; features=features)
         y_true = Y[:, m]
-        y_pred, _ = predict_y(X[:, train_ind], X[:, m],
+        y_pred, _ = gp_inference(dists,
                            Y[:, train_ind], θ; σ_n = σ_n)
         error = metric(y_true, y_pred)
         @show error
