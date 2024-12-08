@@ -2,10 +2,12 @@ using LinearAlgebra, DilPredict, Optimization, OptimizationOptimJL
 using GLMakie, Statistics, SpecialFunctions
 
 function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/",
-                        T_start=1000.0, T_end=200.0, scrunch = false, check_plot=true, scaler=1)
+                        T_start=1000.0, T_end=200.0, scrunch = false, check_plot=false, scaler=1)
     trial = DilPredict.get_trial(trial_path)
 
-    # Check to make sure everything lines up; can be disabled for dev work
+    # Plot the data to make sure T_start and T_end are not 
+    # cutting anything off -- disabled by default but useful for 
+    # debugging
     if check_plot
         f = Figure()
         ax1 = Axis(f[1,1]; xlabel="Time (s)", ylabel="Temp (C)")
@@ -24,6 +26,8 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     end
 
     # Regularizing the data and pulling out features
+    # For more info on how regularization is done, 
+    # see `DilPredict` package
     tsteps = minimum([median(diff(i.time)) for i in trial.runs]) * scaler
     @show tsteps
     regpack = DilPredict.regularize(trial, tsteps; T_start=T_start, T_end=T_end)
@@ -173,29 +177,116 @@ function T_dist(X1, X2)
 end
 return T_dist
 
+"""
+    build_all_distance_tensors(X_all, feature_db_path)
+
+Builds a vector of distance tensors from a temperature matrix.
+Feature matrices are pulled from a database of pre-calculated thermodynamic
+properties stored in a csv file at `feature_db_path`. See the `DilPredict`
+package for more info. 
+"""
+function build_all_distance_tensors(X, feature_db_path)
+    feature_data = DilPredict.pull_tc_data(feature_db_path)
+    feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data)
+    feature_tensor = cat(X, feature_tensor, dims=3)
+
+    vec_of_tensors = map(eachslice(feature_tensor, dims=3)) do k
+        # Adding a small amount to prevent NaN values
+        @views D_slice = cos_dis(k .+ 1e-8)
+    end
+    # The 4th dim contains tensors for each feature
+    tensor_of_tensors = cat(vec_of_tensors..., dims=4)
+    return tensor_of_tensors
+end
+export build_all_distance_tensors
+
+function build_all_distance_tensors(X, X_star, feature_db_path)
+    X = reshape(X, (size(X, 1), size(X, 2)))
+    feature_data = DilPredict.pull_tc_data(feature_db_path)
+    feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data)
+    feature_tensor = cat(X, feature_tensor, dims=3)
+
+    n_features = size(feature_tensor, 3)
+
+    X_star_mat = reshape(X_star, (size(X_star, 1), (size(X_star, 2))))
+
+    feature_tensor_star = temps_to_feature_tensor(
+        X_star_mat, 
+        feature_data
+    )
+    feature_tensor_star = cat(X_star, feature_tensor_star, dims=3)
+
+    vec_of_tensors = map(1:n_features) do i
+        # Adding a small amount to prevent NaN values
+        @views D_slice = cos_dis(
+            (feature_tensor .+ 1e-8)[:,:,i], (feature_tensor_star .+ 1e-8)[:,:,i])
+    end
+    # The 4th dim contains tensors for each feature
+    tensor_of_tensors = cat(vec_of_tensors..., dims=4)
+    return tensor_of_tensors
+end
+export build_all_distance_tensors
+
+"""
+    full_K_dists(X, X_star, tcpath)
+
+Returns all distance tensors required for the `gp_inference` function.
+"""
+function full_K_dists(X, X_star, tcpath; features=[])
+    # Force X_star to be a matrix
+    X_star = reshape(X_star, (size(X_star, 1), size(X_star, 2)))
+
+    if isempty(features)
+        dist_tensor_XX = build_all_distance_tensors(X, tcpath)
+        dist_tensor_sX = build_all_distance_tensors(X_star, X, tcpath)
+        dist_tensor_ss = build_all_distance_tensors(X_star, tcpath)
+        return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
+    else
+        dist_tensor_XX = build_all_distance_tensors(X, tcpath)[:,:,:,features]
+        dist_tensor_sX = build_all_distance_tensors(X_star, X, tcpath)[:,:,:,features]
+        dist_tensor_ss = build_all_distance_tensors(X_star, tcpath)[:,:,:,features]
+        return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
+    end
+end
+export full_K_dists
+
 ################################################
 #
 # KERNEL FUNCTIONS
 #
 ###############################################
 
-function exponentiated_kernel(D, σ, l, β)
-    K = σ^2 .* exp.(-D.^β./ l^2)
+function exponentiated_kernel(D, l, β)
+    K = exp.(-D.^β./ l^2)
     return K
 end
 export exponentiated_kernel
 
-function matern_kernel(d, σ, l, ν)
+# This is super buggy and painfully slow
+function matern_kernel(d, l, ν)
     y = sqrt(2*ν) .* d
-    σ^2 .* (2^(1 .- ν))./(gamma(ν)) .* (y./l).^ν .* besselk.(ν, y ./ l)
+    (2^(1 .- ν))./(gamma(ν)) .* (y./l).^ν .* besselk.(ν, y ./ l)
 end
 export matern_kernel
 
+# Assumes equal signal noise across all inputs
+# This can be changed
 function signal_noise(D, σ_n)
     N, _, n = size(D)
     return [i==j ? abs(σ_n) : 0 for i in 1:N, j in 1:N, k in 1:n]
 end
 export signal_noise
+
+function K_joined(tensor_of_dist_tensors, σ, l_vec, β_vec)
+    n, _, N, H = size(tensor_of_dist_tensors)
+    kernels = map(1:H) do i
+        K = exponentiated_kernel(
+            tensor_of_dist_tensors[:,:,:,i], l_vec[i], β_vec[i])
+    end
+    # σ acts as a scaling factor to capture latent variance
+    return σ^2 .* sum(kernels)
+end
+export K_joined
 
 ################################################
 #
@@ -204,16 +295,20 @@ export signal_noise
 ###############################################
 
 """
-    nlogp(θ, D_hist, Y; σ_n = 1e-8)::Float64
+    nlogp(θ, vec_of_dist_tensors, Y; σ_n = 1e-8)::Float64
 
-Negative log marginal likelihood. `θ` is the kernel parameters,
-`D_hist` is the distance tensor, and `Y` is the reponse matrix. 
-`σ_n` is the signal noise (standard deviation) -- this represents
-any noise that is inherent to the measurement of the reponse variable. 
-This should not be treated as an optimizer variable because it creates 
-a non-identifiable system; the GP does not know how to discriminate 
-between latent function variance and signal variance. The default value
-of `σ_n = 1e-8` assumes that the signal noise is negligible. 
+Negative log marginal likelihood of GP with parameters `θ` and 
+reponse `Y`. `vec_of_dist_tensors` is a vector of distance 
+tensors; each one correspondes to a feature. This can be 
+generated with `build_all_distance_tensors`, as long as the 
+thermodynamic data is available. 
+
+`θ` must be entered in the following form: 
+
+`[σ, l_f1, β_f1, l_f2, β_f2, ..., l_fh, β_fh]`
+
+Where `h` is the total number of features. `l` denotes the 
+lengthscale parameter and `β` is a shape parameter.
 
 This is calculated by treating
 each slice of the distance tensor as its own gaussian process.
@@ -227,11 +322,14 @@ Individual slices are calculated according to the algorithm
 proposed by K. P. Murphy in 'Probabilistic Machine learning' 
 page 572. ISBN: 978-0-262-04682-4
 """
-function nlogp(θ, D_hist, Y; σ_n = 1.0)::Float64
-    N, _, n = size(D_hist)
-    σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
-    K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
-        .+ signal_noise(D_hist, σ_n))
+function nlogp(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
+    N,_,n, H = size(tensor_of_dist_tensors)
+    σ = θ[1];
+    l_β_mat = reshape(θ[2:end], (2, H))
+    l_vec = l_β_mat[1, :]
+    β_vec = l_β_mat[2, :]
+    K = (K_joined(tensor_of_dist_tensors, σ, l_vec, β_vec)
+        .+ signal_noise(tensor_of_dist_tensors[:,:,:,1], σ_n))
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
         μ_X = 1.0
@@ -253,40 +351,41 @@ calculated for each chunk by individual threads, then these
 averages are averaged over the chunks to find the complete
 average nlogp. 
 """
-function nlogp_threaded(θ, D_hist, Y; σ_n = 1e-8)
-    n = size(D_hist, 3)
-    batch_ind = collect(
-        Iterators.partition(1:n, round(Int, n/Threads.nthreads())))
-    #Y_batch = [Y[batch_ind[i], :] for i in 1:Threads.nthreads()]
-    #D_batch = [D_hist[:, :, batch_ind[i]] for i in 1:Threads.nthreads()]
+function nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
+    N,_, n,H = size(tensor_of_dist_tensors)
+    batch_ind = Iterators.partition(1:n, round(Int, n/Threads.nthreads())) |> collect
     tasks = map(1:Threads.nthreads()) do k 
-        Threads.@spawn nlogp(θ, D_hist[:,:,batch_ind[k]],
-                             Y[batch_ind[k],:]; σ_n = σ_n)
+        Threads.@spawn begin
+        @views nlogp(θ, tensor_of_dist_tensors[:,:,batch_ind[k], :],
+                     Y[batch_ind[k],:]; σ_n = σ_n) * length(batch_ind[k])
+        end
     end
     chunk_sums = fetch.(tasks)
-    return sum(chunk_sums)/Threads.nthreads()
+    return sum(chunk_sums)/n
 end
 export nlogp_threaded
 
-function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)
-    N, _, n = size(D_hist)
-    σ_hist = θ[1]; l_hist = θ[2];
-    σ_inst = 1.0; l_inst = θ[3];
-    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*
-        exponentiated_kernel(D_instant, σ_inst, l_inst)
-        .+ signal_noise(D_hist, σ_n, θ[4], θ[5]))
-    nlogp_all = Vector{Float64}(undef, n)
-    for k in 1:n
-        y = @view Y[k, :]
-        μ_X = mean(y)
-        K_t = @view K[:,:,k]
-        L = cholesky(K_t) 
-        α = L.U \ (L.L \ (y .- μ_X))
-        nlogp_all[k] = 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)
-    end
-    return nlogp_all
-end
-export nlogp_slices
+# This function is used to investigate how the likelihood changes
+# at heach time step. 
+#=function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)=#
+#=    N, _, n = size(D_hist)=#
+#=    σ_hist = θ[1]; l_hist = θ[2];=#
+#=    σ_inst = 1.0; l_inst = θ[3];=#
+#=    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*=#
+#=        exponentiated_kernel(D_instant, σ_inst, l_inst)=#
+#=        .+ signal_noise(D_hist, σ_n, θ[4], θ[5]))=#
+#=    nlogp_all = Vector{Float64}(undef, n)=#
+#=    for k in 1:n=#
+#=        y = @view Y[k, :]=#
+#=        μ_X = mean(y)=#
+#=        K_t = @view K[:,:,k]=#
+#=        L = cholesky(K_t) =#
+#=        α = L.U \ (L.L \ (y .- μ_X))=#
+#=        nlogp_all[k] = 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)=#
+#=    end=#
+#=    return nlogp_all=#
+#=end=#
+#=export nlogp_slices=#
 
 """
     opt_kernel(θi, D_hist; σ_n = 1e-8)
@@ -297,13 +396,31 @@ the negative log marginal likelihood `nlogp`.
 distance tensor, `Y` is the response matrix, `σ_n` 
 is the signal noise. 
 """
-function opt_kernel(θi, D_hist, Y; σ_n = 1e-8)
-    loss(θ, p) = nlogp_threaded(θ, D_hist, Y; σ_n = σ_n)
+function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8)
+    N, _, n, n_f = size(tensor_of_dist_tensors)
+    loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
+
+    lower_bounds = vcat(1e-6, 
+                        repeat([1.0e-6, 1e-6], n_f))
+    upper_bounds = vcat(50,  
+                        repeat([1e6, 2.0], n_f))
 
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
-    prob = OptimizationProblem(of, θi, [], lb=[1.0e-8, 1.0e-6, 0.1],
-                               ub=[50.0, 100.0, 2.0])
-    sol = solve(prob, Optim.BFGS(); show_trace=true)
+    prob = OptimizationProblem(of, θi, [], lb=lower_bounds,
+                               ub=upper_bounds)
+    function cb(p, l)
+        θ_inst = p.u
+        σ = θ_inst[1]
+        θ_mat = reshape(θ_inst[2:end], (2, n_f))
+        println("σ:")
+        display(σ)
+        println("l and β:")
+        display(θ_mat)
+        println("loss: ")
+        display(l)
+        return false
+    end
+    sol = solve(prob, Optim.BFGS(); show_trace=false, callback=cb, time_limit=2000)
     return sol
 end 
 export opt_kernel
@@ -314,32 +431,40 @@ export opt_kernel
 #
 ###############################################
 
-# TODO: Finish adding the inst kernel
-function gp_inference(X, X_star, Y, θ; σ_n = 1.0)
-    if size(X_star, 1) != size(X, 1) 
+function gp_inference(dist_tensor_XX, dist_tensor_sX, dist_tensor_ss,
+                      Y, θ; σ_n = 1.0)
+
+    if size(dist_tensor_sX, 3) != size(dist_tensor_XX, 3) 
             throw("Dim of X_star dne dim of X")
     end
-    n, N = size(X)
-    D_hist = cos_dis(X)
-    D_star_hist = cos_dis(X, X_star)
-    σ_hist = θ[1]; l_hist = θ[2]; β_hist = θ[3]
-    K = (exponentiated_kernel(D_hist, σ_hist, l_hist, β_hist)
-        .+ signal_noise(D_hist, σ_n))
-    K_star = (exponentiated_kernel.(D_star_hist, σ_hist, l_hist, β_hist))
-    k_ss = vec(exponentiated_kernel(cos_dis(X_star), σ_hist, l_hist, β_hist))
 
-    μ = Vector{Float64}(undef, n)
-    s = Vector{Float64}(undef, n)
+    N, _, n, H = size(dist_tensor_XX)
+    M = size(dist_tensor_ss, 2)         # M = # of inference points
+
+    σ = θ[1]
+    θ_mat = reshape(θ[2:end], (2, H))
+    l_vec = θ_mat[1,:]
+    β_vec = θ_mat[2,:]
+
+    K = (K_joined(dist_tensor_XX, σ, l_vec, β_vec)
+        .+ signal_noise(dist_tensor_XX[:,:,:,1], σ_n))
+    K_star = K_joined(dist_tensor_sX, σ, l_vec, β_vec)
+    k_ss = (K_joined(dist_tensor_ss, σ, l_vec, β_vec))
+
+    μ = Matrix{Float64}(undef, n, M)
+    @show size(μ)
+    s = Matrix{Float64}(undef, n, M)
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
-        μ_X = 1.0
+        μ_X = mean(y)
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
         # Assume that μ_* = μ_X:
-        μ[k] = μ_X .+ (K_star_t' * (L.U\(L.L\(y .- μ_X))))[1]
-        ν = (L.L \ K_star_t)
-        s[k] = k_ss[k] - (ν' * ν)[1]
+        μ[k, :] = μ_X .+ (K_star_t * (L.U\(L.L\(y .- μ_X))))
+        ν = (L.L \ K_star_t')
+        # Neglecting the covariance by taking the diagonals
+        s[k, :] = diag(k_ss[k] .- (ν' * ν))
     end
     return μ, s
 end
@@ -352,7 +477,7 @@ Build an input thermal history for inference using a constant cooling
 rate `rate`, time step `dt`, start and stop temperatures `Tstart` and `Tstop`,
 and length `n`.
 """
-function build_x_star(Tstart, Tstop, rate, dt, n)
+function build_x_star(Tstart, Tstop, rate::AbstractFloat, dt, n)
     temps = [Tstart,] 
     crates = [rate,]
     while temps[end] > Tstop
@@ -368,6 +493,19 @@ function build_x_star(Tstart, Tstop, rate, dt, n)
 end
 export build_x_star
 
+function build_x_star(Tstart, Tstop, rates::Vector{<:AbstractFloat}, dt, n)
+    X_star = Matrix{Float64}(undef, n, length(rates))
+    crates = Matrix{Float64}(undef, n, length(rates))
+    Threads.@threads for i in eachindex(rates)
+        X_star[:, i], crates[:, i] = build_x_star(
+            Tstart, Tstop, rates[i], dt, n
+        )
+    end
+
+    return X_star, crates
+end
+export build_x_star
+
 """
     inference_surface(crate_max, crate_min, m, X, Y, t, θ)
 
@@ -380,31 +518,30 @@ of 'points' that will be evaluated between the cooling rates; it determines the
 number of input histories that will be evaluated. If `m = 50`, the model will 
 be evaluated for 50 thermal histories between `crate_min` and `crate_max`
 """
-function inference_surface(crate_max, crate_min, m, X, Y, t, θ;
-                           σ_n = 0.25, T_start=860.0, T_end=250.0)
+function inference_surface(crate_max, crate_min, m, X, Y, t, θ, tcpath;
+                           σ_n = 1e-8, T_start=860.0, T_end=250.0, features=[])
     GLMakie.activate!()
     n, N = size(X)
-    rates = range(crate_min, crate_max; length=m)
+    rates = range(crate_min, crate_max; length=m) |> collect
     means = Matrix{Float64}(undef, n, m)
     vars = Matrix{Float64}(undef, n, m)
-    xstars_T = Matrix{Float64}(undef, n, m)
-    xstars_CR = Matrix{Float64}(undef, n, m)
     dt = mean(diff(t))
-    Threads.@threads for i in 1:m
-        xstars_T[:, i], xstars_CR[:,i] = build_x_star(T_start, T_end, rates[i], dt, n) 
-        means[:, i], vars[:, i] = gp_inference(X, xstars_T[:,i], Y, θ; σ_n=σ_n)
-    end
+
+    xstars_T, xstars_CR = build_x_star(T_start, T_end, rates, dt, n)
+    dists = full_K_dists(X, xstars_T, tcpath; features=features)
+    means, vars = gp_inference(dists..., Y, θ)
+
     f = Figure()
     ax = Axis3(f[1,1];
                xlabel="Temp. (°C)", ylabel="CR (°C/s)", zlabel="ΔL (μm)")
 
-    σ_high = maximum(sqrt.(vars))
-    σ_low = minimum(sqrt.(vars))
+    σ_high = maximum(sqrt.(abs.(vars)))
+    σ_low = minimum(sqrt.(abs.(vars)))
     for i in 1:m
         y = xstars_CR[:, i]
         x = xstars_T[:, i]
         z = means[:,i]
-        σ = sqrt.(vars[:,i])
+        σ = sqrt.(abs.(vars[:,i]))
         dmat = hcat(x,y,z, σ)
         dmat = hcat([dmat[i, :] for i in 1:size(dmat,1) if dmat[i,1] > T_end]...)'
         x = dmat[:, 1]; y = dmat[:, 2]; z = dmat[:,3]; σ = dmat[:,4]
@@ -455,7 +592,7 @@ end
 export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
-function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t; T_end = 250.0)
+function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t, tcpath; T_end = 250.0, features=[])
 axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  ygridvisible=false, xminorticks=IntervalsBetween(2),
                  yminorticks=IntervalsBetween(2),
@@ -465,7 +602,10 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  xminorticksize=5.0)
     n = size(X, 1)
     xstars,_ = build_x_star(T_start, T_end, cr, mean(diff(t)), n)
-    means, vars = gp_inference(X, xstars, Y, θ; σ_n = σ_n)
+    dists = full_K_dists(X, xstars, tcpath; features = features)
+    means, vars = gp_inference(dists..., Y, θ; σ_n = σ_n)
+    means = vec(means)
+    vars = vec(vars)
     f = Figure(; size=(800,480))
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
               axis_kwargs...)
