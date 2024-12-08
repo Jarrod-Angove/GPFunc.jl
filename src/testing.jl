@@ -185,9 +185,10 @@ Feature matrices are pulled from a database of pre-calculated thermodynamic
 properties stored in a csv file at `feature_db_path`. See the `DilPredict`
 package for more info. 
 """
-function build_all_distance_tensors(X, feature_db_path)
+function build_all_distance_tensors(X, feature_db_path; features=[])
     feature_data = DilPredict.pull_tc_data(feature_db_path)
-    feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data)
+    feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data;
+                                                        features=features)
     feature_tensor = cat(X, feature_tensor, dims=3)
 
     vec_of_tensors = map(eachslice(feature_tensor, dims=3)) do k
@@ -200,10 +201,11 @@ function build_all_distance_tensors(X, feature_db_path)
 end
 export build_all_distance_tensors
 
-function build_all_distance_tensors(X, X_star, feature_db_path)
+function build_all_distance_tensors(X, X_star, feature_db_path; features = [])
     X = reshape(X, (size(X, 1), size(X, 2)))
     feature_data = DilPredict.pull_tc_data(feature_db_path)
-    feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data)
+    feature_tensor = DilPredict.temps_to_feature_tensor(
+        X, feature_data; features=features)
     feature_tensor = cat(X, feature_tensor, dims=3)
 
     n_features = size(feature_tensor, 3)
@@ -211,8 +213,7 @@ function build_all_distance_tensors(X, X_star, feature_db_path)
     X_star_mat = reshape(X_star, (size(X_star, 1), (size(X_star, 2))))
 
     feature_tensor_star = temps_to_feature_tensor(
-        X_star_mat, 
-        feature_data
+        X_star_mat, feature_data; features=features
     )
     feature_tensor_star = cat(X_star, feature_tensor_star, dims=3)
 
@@ -236,17 +237,13 @@ function full_K_dists(X, X_star, tcpath; features=[])
     # Force X_star to be a matrix
     X_star = reshape(X_star, (size(X_star, 1), size(X_star, 2)))
 
-    if isempty(features)
-        dist_tensor_XX = build_all_distance_tensors(X, tcpath)
-        dist_tensor_sX = build_all_distance_tensors(X_star, X, tcpath)
-        dist_tensor_ss = build_all_distance_tensors(X_star, tcpath)
-        return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
-    else
-        dist_tensor_XX = build_all_distance_tensors(X, tcpath)[:,:,:,features]
-        dist_tensor_sX = build_all_distance_tensors(X_star, X, tcpath)[:,:,:,features]
-        dist_tensor_ss = build_all_distance_tensors(X_star, tcpath)[:,:,:,features]
-        return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
-    end
+    dist_tensor_XX = build_all_distance_tensors(X,
+                                                tcpath; features=features)
+    dist_tensor_sX = build_all_distance_tensors(X_star, X,
+                                                tcpath; features=features)
+    dist_tensor_ss = build_all_distance_tensors(X_star,
+                                                tcpath; features=features)
+    return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
 end
 export full_K_dists
 
@@ -396,7 +393,7 @@ the negative log marginal likelihood `nlogp`.
 distance tensor, `Y` is the response matrix, `σ_n` 
 is the signal noise. 
 """
-function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8)
+function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8, n_starts = 10)
     N, _, n, n_f = size(tensor_of_dist_tensors)
     loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
     lower_bounds = repeat([0.01, 0.0], n_f)
@@ -406,15 +403,24 @@ function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8)
     prob = OptimizationProblem(of, θi, [], lb=lower_bounds,
                                ub=upper_bounds)
     function cb(p, l)
-        θ_inst = p.u
-        θ_mat = reshape(θ_inst, (2, n_f))
-        println("l and β:")
-        display(θ_mat)
-        println("loss: ")
-        display(l)
+        #θ_inst = p.u
+        #θ_mat = reshape(θ_inst, (2, n_f))
+        #println("l and β:")
+        #display(θ_mat)
+        #println("loss: ")
+        #display(l)
         return false
     end
-    sol = solve(prob, Optim.BFGS(); show_trace=false, callback=cb, time_limit=1000)
+    n_params = length(θi)
+    inits = repeat([θi], n_starts)
+    rand_add = [rand(n_params) for i in 1:20]
+    starts = [inits[i] .+ rand_add[i] for i in 1:n_starts]
+    ensembleprob = Optimization.EnsembleProblem(prob,
+                                                starts
+    )
+    sol = solve(ensembleprob, Optim.BFGS(), EnsembleThreads();
+                trajectories = n_starts,
+                show_trace=false, callback=cb, time_limit=3600)
     return sol
 end 
 export opt_kernel

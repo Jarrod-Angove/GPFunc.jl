@@ -17,7 +17,7 @@ end
 
 # K-folds test based on pre-trained parameters
 function kfolds_pretrained(dists, Y, θ, tcpath; metric=rmse, k=0, σ_n, features=[])
-    if k = 0 
+    if k == 0 
         k = size(dists[1], 2)
     end
     n_samples = size(X,2)
