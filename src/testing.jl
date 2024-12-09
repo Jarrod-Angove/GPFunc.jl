@@ -251,8 +251,8 @@ export full_K_dists
 #
 ###############################################
 
-function exponentiated_kernel(D, l, β)
-    K = β^2 .* exp.(-D ./ l^2)
+function exponentiated_kernel(D, l)
+    K = exp.(-D ./ l^2)
     return K
 end
 export exponentiated_kernel
@@ -272,14 +272,14 @@ function signal_noise(D, σ_n)
 end
 export signal_noise
 
-function K_joined(tensor_of_dist_tensors, l_vec, β_vec)
+function K_joined(tensor_of_dist_tensors, σ, l_vec)
     n, _, N, H = size(tensor_of_dist_tensors)
     kernels = map(1:H) do i
         K = exponentiated_kernel(
-            tensor_of_dist_tensors[:,:,:,i], l_vec[i], β_vec[i])
+            tensor_of_dist_tensors[:,:,:,i], l_vec[i])
     end
     # σ acts as a scaling factor to capture latent variance
-    return sum(kernels)
+    return σ^2 .* sum(kernels)
 end
 export K_joined
 
@@ -320,16 +320,15 @@ page 572. ISBN: 978-0-262-04682-4
 function nlogp(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
     N,_,n, H = size(tensor_of_dist_tensors)
 
-    l_β_mat = reshape(θ, (2, H))
-    l_vec = l_β_mat[1, :]
-    β_vec = l_β_mat[2, :]
+    σ = θ[1]
+    l_vec = θ[2:end]
 
-    K = (K_joined(tensor_of_dist_tensors, l_vec, β_vec)
+    K = (K_joined(tensor_of_dist_tensors, σ, l_vec)
         .+ signal_noise(tensor_of_dist_tensors[:,:,:,1], σ_n))
 
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
-        μ_X = 1.0
+        μ_X = mean(y)
         K_t = @view K[:,:,k]
         L = cholesky(K_t) 
         α = L.U \ (L.L \ (y .- μ_X))
@@ -376,26 +375,27 @@ function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8,
                     n_starts = 10, t_limit = 100)
     N, _, n, n_f = size(tensor_of_dist_tensors)
     loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
-    lower_bounds = repeat([0.08, 1e-8], n_f)
-    upper_bounds = repeat([300.0, 5.0], n_f)
+    lower_bounds = vcat([1e-6], repeat([0.08], n_f))
+    upper_bounds = vcat([50.0], repeat([300.0], n_f))
 
-    of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
+    of = OptimizationFunction(loss, AutoForwardDiff())
     prob = OptimizationProblem(of, θi, [], lb=lower_bounds,
                                ub=upper_bounds)
     function cb(p, l)
         θ_inst = p.u
-        θ_mat = reshape(θ_inst, (2, n_f))
-        println("l and β:")
-        display(θ_mat)
-        println("loss: ")
-        display(l)
+        σ = θ_inst[1]
+        l_vec = θ_inst[2:end]
+        println("σ: $σ")
+        println("l: $l_vec")
+        println("loss: $l")
         return false
     end
 
     # Single-start options
     if n_starts==1
-        sol = solve(prob, Optim.BFGS();
-                show_trace=false, callback=cb, time_limit=t_limit)
+        sol = solve(prob, Optim.SAMIN();
+                show_trace=false, callback=cb, time_limit=t_limit,
+                    maxiters=10^6)
         return sol
     end
 
@@ -439,22 +439,20 @@ function gp_inference(dist_tensor_XX, dist_tensor_sX, dist_tensor_ss,
     N, _, n, H = size(dist_tensor_XX)
     M = size(dist_tensor_ss, 2)         # M = # of inference points
 
-    θ_mat = reshape(θ, (2, H))
-    @show θ_mat
-    l_vec = θ_mat[1,:]
-    β_vec = θ_mat[2,:]
+    σ = θ[1]
+    l_vec = θ[2:end]
 
-    K = (K_joined(dist_tensor_XX, l_vec, β_vec)
+    K = (K_joined(dist_tensor_XX, σ, l_vec)
         .+ signal_noise(dist_tensor_XX[:,:,:,1], σ_n))
-    K_star = K_joined(dist_tensor_sX, l_vec, β_vec)
-    k_ss = (K_joined(dist_tensor_ss, l_vec, β_vec))
+    K_star = K_joined(dist_tensor_sX, σ, l_vec)
+    k_ss = (K_joined(dist_tensor_ss, σ, l_vec))
 
     μ = Matrix{Float64}(undef, n, M)
     s = Matrix{Float64}(undef, n, M)
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
-        μ_X = 1.0
+        μ_X = mean(y)
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
         # Assume that μ_* = μ_X:
@@ -551,7 +549,7 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ, tcpath;
         lines!(ax,x,y,z, color=σ, linewidth=3, colorrange=(σ_low, σ_high))
     end
     Colorbar(f[1,2], limits = (σ_low, σ_high))
-    display(f)
+    return f
 end
 export inference_surface
 
