@@ -178,7 +178,7 @@ end
 return T_dist
 
 """
-    build_all_distance_tensors(X_all, feature_db_path)
+    build_all_distance_tensors(X, feature_db_path)
 
 Builds a vector of distance tensors from a temperature matrix.
 Feature matrices are pulled from a database of pre-calculated thermodynamic
@@ -189,7 +189,6 @@ function build_all_distance_tensors(X, feature_db_path; features=[])
     feature_data = DilPredict.pull_tc_data(feature_db_path)
     feature_tensor = DilPredict.temps_to_feature_tensor(X, feature_data;
                                                         features=features)
-    feature_tensor = cat(X, feature_tensor, dims=3)
 
     vec_of_tensors = map(eachslice(feature_tensor, dims=3)) do k
         # Adding a small amount to prevent NaN values
@@ -206,7 +205,6 @@ function build_all_distance_tensors(X, X_star, feature_db_path; features = [])
     feature_data = DilPredict.pull_tc_data(feature_db_path)
     feature_tensor = DilPredict.temps_to_feature_tensor(
         X, feature_data; features=features)
-    feature_tensor = cat(X, feature_tensor, dims=3)
 
     n_features = size(feature_tensor, 3)
 
@@ -294,18 +292,18 @@ export K_joined
 """
     nlogp(θ, vec_of_dist_tensors, Y; σ_n = 1e-8)::Float64
 
-Negative log marginal likelihood of GP with parameters `θ` and 
-reponse `Y`. `vec_of_dist_tensors` is a vector of distance 
-tensors; each one correspondes to a feature. This can be 
-generated with `build_all_distance_tensors`, as long as the 
+Negative log marginal likelihood of GP with parameters `θ` and reponse `Y`.
+`tensor_of_dist_tensors` has dimensions K by K by N by F where K is the number
+of time steps, N is the number of samples, and F is the number of features.
+This can be generated with `build_all_distance_tensors`, as long as the
 thermodynamic data is available. 
 
 `θ` must be entered in the following form: 
 
-`[σ, l_f1, β_f1, l_f2, β_f2, ..., l_fh, β_fh]`
+`[l_f1, β_f1, l_f2, β_f2, ..., l_fh, β_fh]`
 
 Where `h` is the total number of features. `l` denotes the 
-lengthscale parameter and `β` is a shape parameter.
+lengthscale parameter and `β` denotes the pre-exponential parameter (σ).
 
 This is calculated by treating
 each slice of the distance tensor as its own gaussian process.
@@ -321,12 +319,14 @@ page 572. ISBN: 978-0-262-04682-4
 """
 function nlogp(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
     N,_,n, H = size(tensor_of_dist_tensors)
-    #σ = θ[1];
+
     l_β_mat = reshape(θ, (2, H))
     l_vec = l_β_mat[1, :]
     β_vec = l_β_mat[2, :]
+
     K = (K_joined(tensor_of_dist_tensors, l_vec, β_vec)
         .+ signal_noise(tensor_of_dist_tensors[:,:,:,1], σ_n))
+
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
         μ_X = 1.0
@@ -362,27 +362,6 @@ function nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
 end
 export nlogp_threaded
 
-# This function is used to investigate how the likelihood changes
-# at heach time step. 
-#=function nlogp_slices(θ, D_hist, D_instant, Y; σ_n = 5.0)=#
-#=    N, _, n = size(D_hist)=#
-#=    σ_hist = θ[1]; l_hist = θ[2];=#
-#=    σ_inst = 1.0; l_inst = θ[3];=#
-#=    K = (exponentiated_kernel(D_hist, σ_hist, l_hist) .*=#
-#=        exponentiated_kernel(D_instant, σ_inst, l_inst)=#
-#=        .+ signal_noise(D_hist, σ_n, θ[4], θ[5]))=#
-#=    nlogp_all = Vector{Float64}(undef, n)=#
-#=    for k in 1:n=#
-#=        y = @view Y[k, :]=#
-#=        μ_X = mean(y)=#
-#=        K_t = @view K[:,:,k]=#
-#=        L = cholesky(K_t) =#
-#=        α = L.U \ (L.L \ (y .- μ_X))=#
-#=        nlogp_all[k] = 0.5 * ((y .- μ_X)'*α) + sum(log.(diag(L.L))) + N/2 * log(2π)=#
-#=    end=#
-#=    return nlogp_all=#
-#=end=#
-#=export nlogp_slices=#
 
 """
     opt_kernel(θi, D_hist; σ_n = 1e-8)
@@ -393,37 +372,56 @@ the negative log marginal likelihood `nlogp`.
 distance tensor, `Y` is the response matrix, `σ_n` 
 is the signal noise. 
 """
-function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8, n_starts = 10)
+function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8,
+                    n_starts = 10, t_limit = 100)
     N, _, n, n_f = size(tensor_of_dist_tensors)
     loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
-    lower_bounds = repeat([0.01, 0.0], n_f)
-    upper_bounds = repeat([200, 200.0], n_f)
+    lower_bounds = repeat([0.08, 1e-8], n_f)
+    upper_bounds = repeat([300.0, 5.0], n_f)
 
     of = OptimizationFunction(loss, AutoForwardDiff())#; grad = loss_grad!)
     prob = OptimizationProblem(of, θi, [], lb=lower_bounds,
                                ub=upper_bounds)
     function cb(p, l)
-        #θ_inst = p.u
-        #θ_mat = reshape(θ_inst, (2, n_f))
-        #println("l and β:")
-        #display(θ_mat)
-        #println("loss: ")
-        #display(l)
+        θ_inst = p.u
+        θ_mat = reshape(θ_inst, (2, n_f))
+        println("l and β:")
+        display(θ_mat)
+        println("loss: ")
+        display(l)
         return false
     end
+
+    # Single-start options
+    if n_starts==1
+        sol = solve(prob, Optim.BFGS();
+                show_trace=false, callback=cb, time_limit=t_limit)
+        return sol
+    end
+
+    # Multi-start options
     n_params = length(θi)
     inits = repeat([θi], n_starts)
-    rand_add = [rand(n_params) for i in 1:20]
-    starts = [inits[i] .+ rand_add[i] for i in 1:n_starts]
-    ensembleprob = Optimization.EnsembleProblem(prob,
-                                                starts
-    )
+    rand_add = [rand(n_params) for i in 1:n_starts]
+    starts = [inits[i] .+ 5 .* rand_add[i] for i in 1:n_starts]
+    ensembleprob = Optimization.EnsembleProblem(prob, starts)
+
     sol = solve(ensembleprob, Optim.BFGS(), EnsembleThreads();
                 trajectories = n_starts,
-                show_trace=false, callback=cb, time_limit=3600)
+                show_trace=false, callback=cb, time_limit=t_limit/n_starts)
+
+    best_ind = argmin(i -> sol[i].objective, 1:n_starts)
+    println("Best loss: $(sol[best_ind].objective)")
+    println("Optimized params: $(sol[best_ind].u)")
     return sol
 end 
 export opt_kernel
+
+function getminparams(sol)
+    best_ind = argmin(i -> sol[i].objective, 1:length(sol))
+    return sol[best_ind].u
+end
+export getminparams
 
 ################################################
 #
@@ -442,6 +440,7 @@ function gp_inference(dist_tensor_XX, dist_tensor_sX, dist_tensor_ss,
     M = size(dist_tensor_ss, 2)         # M = # of inference points
 
     θ_mat = reshape(θ, (2, H))
+    @show θ_mat
     l_vec = θ_mat[1,:]
     β_vec = θ_mat[2,:]
 
@@ -455,7 +454,7 @@ function gp_inference(dist_tensor_XX, dist_tensor_sX, dist_tensor_ss,
     for k in 1:n
         K_t = K[:,:,k]
         y = Y[k, :]
-        μ_X = mean(y)
+        μ_X = 1.0
         K_star_t = K_star[:, :, k]
         L = cholesky(K_t)
         # Assume that μ_* = μ_X:
