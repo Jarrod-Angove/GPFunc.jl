@@ -390,7 +390,7 @@ function opt_kernel(θi, D_XX, Y; σ_n = 1e-8,
 
     # Single-start options
     if n_starts==1
-        sol = solve(prob, Optim.SAMIN();
+        sol = solve(prob, Optim.BFGS();
                 show_trace=false, time_limit=t_limit,
                     maxiters=10^6)
         return sol
