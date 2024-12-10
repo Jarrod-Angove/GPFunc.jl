@@ -37,7 +37,7 @@ function pull_test_data(;trial_path = "../dil_data/dil_X70_2014-05-28_ualberta/"
     dTdt = hcat(regpack.dTdt...)
     f = hcat(regpack.f...)
     t = regpack.t
-# Make all of the ΔLs at T_start the same (equal to mean)
+    # Make all of the ΔLs at T_start the same (equal to mean)
     if scrunch
         N = size(Y,2)
         ave_dLi = mean([Y[1, i] for i in 1:N])
@@ -235,13 +235,10 @@ function full_K_dists(X, X_star, tcpath; features=[])
     # Force X_star to be a matrix
     X_star = reshape(X_star, (size(X_star, 1), size(X_star, 2)))
 
-    dist_tensor_XX = build_all_distance_tensors(X,
-                                                tcpath; features=features)
-    dist_tensor_sX = build_all_distance_tensors(X_star, X,
-                                                tcpath; features=features)
-    dist_tensor_ss = build_all_distance_tensors(X_star,
-                                                tcpath; features=features)
-    return (dist_tensor_XX, dist_tensor_sX, dist_tensor_ss)
+    D_XX = build_all_distance_tensors(X, tcpath; features=features)
+    D_sX = build_all_distance_tensors(X_star, X, tcpath; features=features)
+    D_ss = build_all_distance_tensors(X_star, tcpath; features=features)
+    return (D_XX, D_sX, D_ss)
 end
 export full_K_dists
 
@@ -290,20 +287,20 @@ export K_joined
 ###############################################
 
 """
-    nlogp(θ, vec_of_dist_tensors, Y; σ_n = 1e-8)::Float64
+    nlogp(θ, D_XX, Y; σ_n = 1e-8)::Float64
 
 Negative log marginal likelihood of GP with parameters `θ` and reponse `Y`.
-`tensor_of_dist_tensors` has dimensions K by K by N by F where K is the number
+`D_XX` has dimensions K by K by N by F where K is the number
 of time steps, N is the number of samples, and F is the number of features.
 This can be generated with `build_all_distance_tensors`, as long as the
 thermodynamic data is available. 
 
 `θ` must be entered in the following form: 
 
-`[l_f1, β_f1, l_f2, β_f2, ..., l_fh, β_fh]`
+`[σ, l_f1, ..., l_fh]`
 
 Where `h` is the total number of features. `l` denotes the 
-lengthscale parameter and `β` denotes the pre-exponential parameter (σ).
+lengthscale parameter and `σ` denotes the pre-exponential parameter.
 
 This is calculated by treating
 each slice of the distance tensor as its own gaussian process.
@@ -317,14 +314,14 @@ Individual slices are calculated according to the algorithm
 proposed by K. P. Murphy in 'Probabilistic Machine learning' 
 page 572. ISBN: 978-0-262-04682-4
 """
-function nlogp(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
-    N,_,n, H = size(tensor_of_dist_tensors)
+function nlogp(θ, D_XX, Y; σ_n = 1e-8)
+    N,_,n, H = size(D_XX)
 
     σ = θ[1]
     l_vec = θ[2:end]
 
-    K = (K_joined(tensor_of_dist_tensors, σ, l_vec)
-        .+ signal_noise(tensor_of_dist_tensors[:,:,:,1], σ_n))
+    K = (K_joined(D_XX, σ, l_vec)
+        .+ signal_noise(D_XX[:,:,:,1], σ_n))
 
     nlogp_all = map(1:n) do k 
         y = @view Y[k, :]
@@ -339,7 +336,7 @@ end
 export nlogp
 
 """
-    nlogp_threaded(θ, D_hist, Y; σ_n = 1e-8)
+    nlogp_threaded(θ, D_XX, Y; σ_n = 1e-8)
 
 A mulithreaded version of the `nlogp` function. This works
 by splitting the kernel into a chunks; average nlogp is 
@@ -347,12 +344,12 @@ calculated for each chunk by individual threads, then these
 averages are averaged over the chunks to find the complete
 average nlogp. 
 """
-function nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = 1e-8)
-    N,_, n,H = size(tensor_of_dist_tensors)
+function nlogp_threaded(θ, D_XX, Y; σ_n = 1e-8)
+    N,_, n,H = size(D_XX)
     batch_ind = Iterators.partition(1:n, round(Int, n/Threads.nthreads())) |> collect
     tasks = map(1:Threads.nthreads()) do k 
         Threads.@spawn begin
-        @views nlogp(θ, tensor_of_dist_tensors[:,:,batch_ind[k], :],
+        @views nlogp(θ, D_XX[:,:,batch_ind[k], :],
                      Y[batch_ind[k],:]; σ_n = σ_n) * length(batch_ind[k])
         end
     end
@@ -371,10 +368,10 @@ the negative log marginal likelihood `nlogp`.
 distance tensor, `Y` is the response matrix, `σ_n` 
 is the signal noise. 
 """
-function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8,
+function opt_kernel(θi, D_XX, Y; σ_n = 1e-8,
                     n_starts = 10, t_limit = 100)
-    N, _, n, n_f = size(tensor_of_dist_tensors)
-    loss(θ, p) = nlogp_threaded(θ, tensor_of_dist_tensors, Y; σ_n = σ_n)
+    N, _, n, n_f = size(D_XX)
+    loss(θ, p) = nlogp_threaded(θ, D_XX, Y; σ_n = σ_n)
     lower_bounds = vcat([1e-6], repeat([0.08], n_f))
     upper_bounds = vcat([50.0], repeat([300.0], n_f))
 
@@ -393,7 +390,7 @@ function opt_kernel(θi, tensor_of_dist_tensors, Y; σ_n = 1e-8,
 
     # Single-start options
     if n_starts==1
-        sol = solve(prob, Optim.SAMIN();
+        sol = solve(prob, Optim.BFGS();
                 show_trace=false, callback=cb, time_limit=t_limit,
                     maxiters=10^6)
         return sol
@@ -514,7 +511,8 @@ number of input histories that will be evaluated. If `m = 50`, the model will
 be evaluated for 50 thermal histories between `crate_min` and `crate_max`
 """
 function inference_surface(crate_max, crate_min, m, X, Y, t, θ, tcpath;
-                           σ_n = 1e-8, T_start=860.0, T_end=250.0, features=[])
+                           σ_n = 1e-8, T_start=860.0, T_end=250.0, features=[],
+                           obfuscate=false)
     GLMakie.activate!()
     n, N = size(X)
     rates = range(crate_min, crate_max; length=m) |> collect
@@ -549,6 +547,13 @@ function inference_surface(crate_max, crate_min, m, X, Y, t, θ, tcpath;
         lines!(ax,x,y,z, color=σ, linewidth=3, colorrange=(σ_low, σ_high))
     end
     Colorbar(f[1,2], limits = (σ_low, σ_high))
+
+    Tmax = T_start
+    if obfuscate
+        ax.xtickformat = x -> string.(round.(x./Tmax, sigdigits=2))
+        ax.xlabel = "Temperature (scaled)"
+    end
+
     return f
 end
 export inference_surface
@@ -593,8 +598,13 @@ end
 export inference_surface_t
 # θi = [17.414065021040688, 0.5896643153148926, 0.04492645656636867]
 
-function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t, tcpath; T_end = 250.0, features=[])
-axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
+function single_cr_plot(cr, X, Y, θ, σ_n, T_start, t, tcpath; T_end = 250.0,
+                        features=[], obfuscate=false)
+    CairoMakie.activate!()
+    set_theme!(fontsize = 12, fonts = (; regular = "Libertinus Serif"))
+    inch = 96; pt = 4/3;
+    f = Figure(size = (7.5inch, 4.5inch), fontsize=12pt)
+    axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
                  ygridvisible=false, xminorticks=IntervalsBetween(2),
                  yminorticks=IntervalsBetween(2),
                  xminorticksvisible=true, yminorticksvisible=true, 
@@ -607,15 +617,23 @@ axis_kwargs = (xminortickalign=1.0, yminortickalign=1.0, xgridvisible=false,
     means, vars = gp_inference(dists..., Y, θ; σ_n = σ_n)
     means = vec(means)
     vars = vec(vars)
-    f = Figure(; size=(800,480))
+    ΔL_max = maximum(means) 
+    ΔL_min = minimum(means)
     ax = Axis(f[1,1]; xlabel="Temp. (°C)", ylabel="ΔL (μm)", xreversed=true,
-              axis_kwargs...)
+              axis_kwargs..., limits=((T_end + 5.0, T_start), (ΔL_min - 15.0, ΔL_max + 10.0)))
     lower = means .- sqrt.(abs.(vars))
     upper = means .+ sqrt.(abs.(vars))
     band!(ax, xstars, lower, upper; alpha=0.3)
-    lines!(ax, xstars, means; label="CR = $cr (°C/s)")
-    #axislegend(ax)
-    return f
+    lines!(ax, xstars, means; label="Pred. ΔL for $cr °C/s")
+    #axislegend(ax, framevisible=false)
+    
+    Tmax = T_start
+    if obfuscate
+        ax.xtickformat = x -> string.(round.(x./Tmax, sigdigits=2))
+        ax.xlabel = "Temperature (scaled)"
+    end
+
+    return f, ax
 end
 export single_cr_plot
 
