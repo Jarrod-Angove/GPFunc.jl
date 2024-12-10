@@ -369,10 +369,10 @@ distance tensor, `Y` is the response matrix, `σ_n`
 is the signal noise. 
 """
 function opt_kernel(θi, D_XX, Y; σ_n = 1e-8,
-                    n_starts = 10, t_limit = 100)
+                    n_starts = 10, t_limit = 200)
     N, _, n, n_f = size(D_XX)
     loss(θ, p) = nlogp_threaded(θ, D_XX, Y; σ_n = σ_n)
-    lower_bounds = vcat([1e-6], repeat([0.08], n_f))
+    lower_bounds = vcat([1e-6], repeat([0.05], n_f))
     upper_bounds = vcat([50.0], repeat([300.0], n_f))
 
     of = OptimizationFunction(loss, AutoForwardDiff())
@@ -390,8 +390,8 @@ function opt_kernel(θi, D_XX, Y; σ_n = 1e-8,
 
     # Single-start options
     if n_starts==1
-        sol = solve(prob, Optim.BFGS();
-                show_trace=false, callback=cb, time_limit=t_limit,
+        sol = solve(prob, Optim.SAMIN();
+                show_trace=false, time_limit=t_limit,
                     maxiters=10^6)
         return sol
     end

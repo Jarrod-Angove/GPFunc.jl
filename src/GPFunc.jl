@@ -1,6 +1,6 @@
 module GPFunc
 
-include("./testing.jl")
+include("./model.jl")
 include("./pres_plots.jl")
 include("./validation.jl")
 #include("./testing_gpu.jl")

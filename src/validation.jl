@@ -1,5 +1,5 @@
 # This file contains code for validating/testing the model
-using Statistics
+using Statistics, Printf
 
 # Root mean squared error
 rmse(y_true, y_pred) = sqrt(mean((y_true .- y_pred).^2))
@@ -23,7 +23,7 @@ end
 export test_likelihood
 
 function leave_one_out_retrained(θ_init, X, Y, tcpath; σ_n=1e-8,
-                               features = [1], t_limit=1000)
+                               features = [1], t_limit=100)
     n_samples = size(X,2)
     all_ind = collect(1:n_samples)
     R2s = Vector{Float64}(undef, n_samples)   # coefficients of determination
@@ -75,7 +75,7 @@ function leave_one_out_retrained(θ_init, X, Y, tcpath; σ_n=1e-8,
 end
 export leave_one_out_retrained
 
-function run_all_validations(X, Y, tcpath; σ_n = 1e-8)
+function run_all_validations(X, Y, tcpath; σ_n = 1e-8, t_limit=200)
     feature_sets = [[1], [5], [6], [7], [1,5,6,7]]
     measure_entry = []
     full_H = []
@@ -86,16 +86,21 @@ function run_all_validations(X, Y, tcpath; σ_n = 1e-8)
         n_features = length(features)
         θi = vcat([5.0], repeat([0.1], n_features))
         H = leave_one_out_retrained(θi, X,Y, tcpath; σ_n = σ_n,
-                                    features=features)
+                                    features=features, t_limit=t_limit)
         push!(full_H, H)
         summary_vec = []
         for col in eachcol(H)
-            μ = mean(col); σ = std(col)
-            sum_string = "$μ ± $σ"
+            μ = round(mean(col); sigdigits=4);
+            σ = round(std(col);sigdigits=3);
+            sum_string = "$(@sprintf("%1.4g", μ)) ± $(@sprintf("%1.3g", σ))"
             push!(summary_vec, sum_string)
         end
         push!(summary_vecs, summary_vec)
     end
+    my_summary = [summary_vecs[i][j] for i in 1:length(feature_sets), j in 1:4]
     return summary_vecs, full_H
 end
 export run_all_validations
+
+to_table_form(my_summary) = [prod(["[$(my_summary[j][i])], " for i in 1:3]) for j in 1:5]
+export to_table_form
